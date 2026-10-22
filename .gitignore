@@ -1,0 +1,56 @@
+﻿# Environment variables and secrets
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+**/secrets/
+
+# Python backend
+**/.venv/
+**/venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+
+# Flutter and Dart generated files
+**/.dart_tool/
+**/build/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.packages
+**/coverage/
+
+# Local databases, dumps and logs
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+*.dump
+*.log
+
+# Android signing files
+**/key.properties
+**/*.jks
+**/*.keystore
+
+# IDE and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local backup copies — keep the original source files
+**/*backup*
+**/*.backup
+
+# Local diagnostic scripts; review separately if needed
+**/test_email.py
+**/test_db.py
