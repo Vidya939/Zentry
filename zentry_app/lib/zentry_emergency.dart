@@ -90,7 +90,9 @@ class _ZentryEmergencyState extends State<ZentryEmergency> {
     try {
       final response = await http
           .get(
-            Uri.parse('http://10.0.2.2:8000/incidents/active'),
+Uri.parse(
+  'https://lives-cheaper-hello-perform.trycloudflare.com/incidents/active',
+),
             headers: {'Accept': 'application/json'},
           )
           .timeout(const Duration(seconds: 5));
@@ -346,11 +348,27 @@ class _ZentryEmergencyState extends State<ZentryEmergency> {
               // SAFE - STILL INSIDE
               InkWell(
                 onTap: () {
-                  _submitSafetyStatus(
-                    status: 'SAFE_INSIDE',
-                    destination: const ZentrySafeInside(),
+                  final incidentId = int.tryParse(
+                    _incident?['id'].toString() ?? '',
+                  );
+
+                  if (incidentId == null) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('No active incident found.'),
+                      ),
+                    );
+                    return;
+                  }
+
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => ZentrySafeInside(incidentId: incidentId),
+                    ),
                   );
                 },
+
                 child: Card(
                   margin: const EdgeInsetsDirectional.only(bottom: 10),
                   shape: const RoundedRectangleBorder(),
@@ -395,11 +413,27 @@ class _ZentryEmergencyState extends State<ZentryEmergency> {
               // I NEED HELP
               InkWell(
                 onTap: () {
-                  _submitSafetyStatus(
-                    status: 'NEED_HELP',
-                    destination: const ZentryHelp(),
+                  final incidentId = int.tryParse(
+                    _incident?['id'].toString() ?? '',
+                  );
+
+                  if (incidentId == null) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('No active incident found.'),
+                      ),
+                    );
+                    return;
+                  }
+
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => ZentryHelp(incidentId: incidentId),
+                    ),
                   );
                 },
+
                 child: Card(
                   margin: const EdgeInsetsDirectional.only(bottom: 10),
                   shape: const RoundedRectangleBorder(),

@@ -1,21 +1,9 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 
-import './web_api_service.dart';
-import './web_login.dart';
-
-const Color _navy = Color(0xFF17263D);
-const Color _pageBackground = Color(0xFFF4F6FA);
-const Color _mutedText = Color(0xFF65748B);
-const Color _borderColor = Color(0xFFE4E9F1);
-const Color _green = Color(0xFF168568);
-const Color _red = Color(0xFFD94848);
-const Color _blue = Color(0xFF3478C8);
-const Color _amber = Color(0xFFD97706);
-const Color _purple = Color(0xFF7C5BB5);
+import 'web_api_service.dart';
+import 'web_login.dart';
 
 class WebHome extends StatefulWidget {
   const WebHome({super.key});
@@ -25,51 +13,415 @@ class WebHome extends StatefulWidget {
 }
 
 class _WebHomeState extends State<WebHome> {
-  static const String api = WebApiService.baseUrl;
-
   Timer? _timer;
-  bool _busy = false;
-  bool _loading = true;
-  bool _sidebarExpanded = true;
 
+  String _page = 'Dashboard';
+  bool _sidebarCollapsed = false;
+  bool _loading = false;
   String? _error;
-  String _selectedPage = 'Dashboard';
-  String _selectedFilter = 'HELP REQUESTED';
+  String? _notice;
 
+  Map<String, dynamic>? _profile;
   Map<String, dynamic>? _incident;
   Map<String, dynamic> _summary = {};
-  List<dynamic> _responses = [];
+  // Map<String, dynamic> _peopleData = {};
 
+  List<Map<String, dynamic>> _employees = [];
+  List<Map<String, dynamic>> _visitors = [];
+  List<Map<String, dynamic>> _incidents = [];
+  List<Map<String, dynamic>> _people = [];
+
+  DateTime? _fromDate;
+  DateTime? _toDate;
+
+  final TextEditingController _searchController = TextEditingController();
+  final TextEditingController _peopleSearchController = TextEditingController();
+
+  final ScrollController _peopleVerticalController = ScrollController();
+  final ScrollController _peopleHorizontalController = ScrollController();
+
+  String _peopleFilter = 'ALL';
   @override
   void initState() {
     super.initState();
-    _refresh();
-    _timer = Timer.periodic(const Duration(seconds: 4), (_) => _refresh());
+    _loadInitial();
+    _timer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (mounted && _page == 'Dashboard') {
+        _refreshIncident(silent: true);
+      }
+    });
   }
 
   @override
   void dispose() {
     _timer?.cancel();
+    _searchController.dispose();
+    _peopleSearchController.dispose();
+    _peopleVerticalController.dispose();
+    _peopleHorizontalController.dispose();
     super.dispose();
   }
 
-  Future<void> _logout() async {
+  int _intValue(dynamic value) {
+    if (value is int) return value;
+    return int.tryParse(value?.toString() ?? '') ?? 0;
+  }
+
+  String _string(dynamic value, [String fallback = '—']) {
+    if (value == null || value.toString().trim().isEmpty) return fallback;
+    return value.toString();
+  }
+
+  bool _active(dynamic value) {
+    return value == true || value == 1 || value.toString() == '1';
+  }
+
+  String _date(dynamic value) {
+    if (value == null || value.toString().trim().isEmpty) {
+      return '—';
+    }
+
+    final parsed = DateTime.tryParse(value.toString().trim());
+
+    if (parsed == null) {
+      return value.toString();
+    }
+
+    // API timestamps with +05:30 or Z already contain timezone information.
+    // Do not add another timezone offset.
+    final ist =
+        parsed.isUtc || value.toString().contains(RegExp(r'[+-]\d{2}:\d{2}$'))
+        ? parsed.toUtc().add(const Duration(hours: 5, minutes: 30))
+        : parsed;
+
+    String twoDigits(int number) => number.toString().padLeft(2, '0');
+
+    return '${twoDigits(ist.day)}/${twoDigits(ist.month)}/${ist.year} '
+        '${twoDigits(ist.hour)}:${twoDigits(ist.minute)} IST';
+  }
+
+  String _dateOnly(DateTime value) {
+    return '${value.day.toString().padLeft(2, '0')}/'
+        '${value.month.toString().padLeft(2, '0')}/'
+        '${value.year}';
+  }
+
+  int? _currentIncidentId() {
+    final value = _incident?['id'];
+    if (value == null) return null;
+    return _intValue(value);
+  }
+
+  Future<void> _loadInitial() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    try {
+      final profile = await WebApiService.getOfficerProfile();
+      if (!mounted) return;
+      setState(() => _profile = profile);
+
+      await _refreshIncident(silent: true);
+      await _loadEmployees();
+      await _loadVisitors();
+      await _loadIncidents();
+    } catch (e) {
+      if (mounted) setState(() => _error = _cleanError(e));
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  String _cleanError(Object error) {
+    return error.toString().replaceFirst('Exception: ', '');
+  }
+
+  Future<void> _runAction(
+    Future<void> Function() action, {
+    String? successMessage,
+  }) async {
+    setState(() {
+      _loading = true;
+      _error = null;
+      _notice = null;
+    });
+
+    try {
+      await action();
+      if (mounted && successMessage != null) {
+        setState(() => _notice = successMessage);
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = _cleanError(e));
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _refreshIncident({bool silent = false}) async {
+    try {
+      final active = await WebApiService.getActiveIncidents();
+      if (!mounted) return;
+
+      if (active.isEmpty) {
+        setState(() {
+          _incident = null;
+          _summary = {};
+          // _peopleData = {};
+          _people = [];
+        });
+        return;
+      }
+
+      final incident = active.first;
+      final id = _intValue(incident['id']);
+
+      final results = await Future.wait([
+        WebApiService.getIncidentSummary(id),
+        WebApiService.getIncidentPeople(id),
+      ]);
+
+      if (!mounted) return;
+
+      final peopleData = Map<String, dynamic>.from(results[1] as Map);
+      final rawPeople = peopleData['people'];
+
+      setState(() {
+        _incident = incident;
+        _summary = Map<String, dynamic>.from(results[0] as Map);
+        // _peopleData = peopleData;
+        _people = rawPeople is List
+            ? rawPeople
+                  .whereType<Map>()
+                  .map((p) => Map<String, dynamic>.from(p))
+                  .toList()
+            : [];
+      });
+    } catch (e) {
+      if (!mounted) return;
+      if (!silent) setState(() => _error = _cleanError(e));
+    }
+  }
+
+  Future<void> _loadEmployees() async {
+    final result = await WebApiService.getEmployees();
+    if (mounted) setState(() => _employees = result);
+  }
+
+  Future<void> _loadVisitors() async {
+    final result = await WebApiService.getVisitors();
+    if (mounted) setState(() => _visitors = result);
+  }
+
+  Future<void> _loadIncidents() async {
+    final result = await WebApiService.getIncidents(
+      fromDate: _fromDate,
+      toDate: _toDate,
+    );
+    if (mounted) setState(() => _incidents = result);
+  }
+
+  Future<void> _reloadCurrentPage() async {
+    await _runAction(() async {
+      switch (_page) {
+        case 'Employees':
+          await _loadEmployees();
+          break;
+        case 'Visitors':
+          await _loadVisitors();
+          break;
+        case 'Incidents':
+          await _loadIncidents();
+          break;
+        case 'Dashboard':
+          await _refreshIncident();
+          break;
+        case 'Requires Action':
+          await _refreshIncident();
+          break;
+      }
+    });
+  }
+
+  Future<void> _createIncidentDialog() async {
+    String selectedType = 'Fire';
+    String selectedLocation = 'Admin Block';
+
+    final message = TextEditingController(
+      text: 'EVACUATE NOW IMMEDIATELY. Proceed to North Car Parking.',
+    );
+
+    try {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => StatefulBuilder(
+          builder: (dialogContext, setDialogState) => AlertDialog(
+            title: const Text('Start emergency incident'),
+            content: SizedBox(
+              width: 440,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    DropdownButtonFormField<String>(
+                      value: selectedType,
+                      decoration: const InputDecoration(
+                        labelText: 'Emergency type',
+                        border: OutlineInputBorder(),
+                      ),
+                      items: const [
+                        DropdownMenuItem(value: 'Fire', child: Text('Fire')),
+                        DropdownMenuItem(value: 'Smoke', child: Text('Smoke')),
+                        DropdownMenuItem(
+                          value: 'Gas Leakage',
+                          child: Text('Gas Leakage'),
+                        ),
+                      ],
+                      onChanged: (value) {
+                        if (value != null) {
+                          setDialogState(() {
+                            selectedType = value;
+                          });
+                        }
+                      },
+                    ),
+                    const SizedBox(height: 12),
+
+                    DropdownButtonFormField<String>(
+                      value: selectedLocation,
+                      decoration: const InputDecoration(
+                        labelText: 'Incident location',
+                        border: OutlineInputBorder(),
+                      ),
+                      items: const [
+                        DropdownMenuItem(
+                          value: 'Admin Block',
+                          child: Text('Admin Block'),
+                        ),
+                        DropdownMenuItem(
+                          value: 'North Block',
+                          child: Text('North Block'),
+                        ),
+                        DropdownMenuItem(
+                          value: 'Conf Room',
+                          child: Text('Conf Room'),
+                        ),
+                        DropdownMenuItem(
+                          value: 'North Block Canteen',
+                          child: Text('North Block Canteen'),
+                        ),
+                      ],
+                      onChanged: (value) {
+                        if (value != null) {
+                          setDialogState(() {
+                            selectedLocation = value;
+                          });
+                        }
+                      },
+                    ),
+                    const SizedBox(height: 16),
+
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFFFE5E5),
+                        border: Border.all(color: Colors.red),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Text(
+                        'EVACUATE NOW IMMEDIATELY',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Colors.red,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 17,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+
+                    const ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: Icon(Icons.groups, color: Colors.blue),
+                      title: Text('Assembly point'),
+                      subtitle: Text('North Car Parking'),
+                    ),
+
+                    TextField(
+                      controller: message,
+                      maxLines: 3,
+                      decoration: const InputDecoration(
+                        labelText: 'Emergency instructions',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(dialogContext, false);
+                },
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                style: FilledButton.styleFrom(backgroundColor: Colors.red),
+                onPressed: () {
+                  Navigator.pop(dialogContext, true);
+                },
+                child: const Text('Start incident'),
+              ),
+            ],
+          ),
+        ),
+      );
+
+      if (confirmed != true || !mounted) return;
+
+      await _runAction(() async {
+        await WebApiService.createIncident(
+          title: selectedType,
+          message: message.text,
+          location: selectedLocation,
+        );
+
+        await _refreshIncident();
+        await _loadIncidents();
+      }, successMessage: 'Incident started.');
+    } finally {
+      message.dispose();
+    }
+  }
+
+  Future<void> _clearIncidentDialog() async {
+    final id = _currentIncidentId();
+    if (id == null) return;
+
+    final safeConfirmed = _intValue(_summary['safe_confirmed']);
+    final expected = _intValue(_summary['expected']);
+
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: const Text('Log out of Zentry?'),
-        content: const Text(
-          'You will need to log in again to access safety operations.',
+        title: const Text('Confirm All Clear'),
+        content: Text(
+          'Safe confirmations: $safeConfirmed of $expected.\n\n'
+          'Only issue All Clear after confirming that the emergency is resolved '
+          'and everyone is safely accounted for.',
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, false),
-            child: const Text('CANCEL'),
+            child: const Text('Cancel'),
           ),
           FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: _red),
             onPressed: () => Navigator.pop(dialogContext, true),
-            child: const Text('LOG OUT'),
+            child: const Text('Request All Clear'),
           ),
         ],
       ),
@@ -77,8 +429,400 @@ class _WebHomeState extends State<WebHome> {
 
     if (confirmed != true || !mounted) return;
 
-    _timer?.cancel();
-    WebApiService.logout();
+    await _runAction(() async {
+      await WebApiService.clearIncident(id);
+      await _refreshIncident();
+      await _loadIncidents();
+    }, successMessage: 'Incident cleared successfully.');
+  }
+
+  Future<void> _dispatchPerson(Map<String, dynamic> person) async {
+    final incidentId = _currentIncidentId();
+    if (incidentId == null) return;
+
+    final type = _string(person['account_type'], 'employee');
+    final personId = _intValue(person['person_id']);
+
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Dispatch warden'),
+        content: Text(
+          'Record a warden dispatch for ${_string(person['name'])} '
+          '(${_string(person['identifier'])})?\n\n'
+          'This records the dispatch. It does not mark the person safe.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Confirm dispatch'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true || !mounted) return;
+
+    await _runAction(() async {
+      await WebApiService.dispatchWarden(
+        incidentId: incidentId,
+        accountType: type,
+        personId: personId,
+      );
+      await _refreshIncident();
+    }, successMessage: 'Warden dispatch recorded.');
+  }
+
+  Future<void> _markLocated(Map<String, dynamic> person) async {
+    final incidentId = _currentIncidentId();
+    if (incidentId == null) return;
+
+    final type = _string(person['account_type'], 'employee');
+    final personId = _intValue(person['person_id']);
+
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Mark person as located'),
+        content: Text(
+          'Mark ${_string(person['name'])} as located?\n\n'
+          'This action records that the person was located. Their '
+          'emergency status will not be changed and All Clear will '
+          'still require a safe status confirmation.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Mark located'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true || !mounted) return;
+
+    await _runAction(() async {
+      await WebApiService.markLocated(
+        incidentId: incidentId,
+        accountType: type,
+        personId: personId,
+      );
+      await _refreshIncident();
+    }, successMessage: 'Person marked as located, not as safe.');
+  }
+
+  Future<void> _editProfileDialog() async {
+    final name = TextEditingController(
+      text: _string(_profile?['full_name'], ''),
+    );
+    final location = TextEditingController(
+      text: _string(_profile?['location'], ''),
+    );
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Officer profile'),
+        content: SizedBox(
+          width: 420,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: name,
+                decoration: const InputDecoration(labelText: 'Full name'),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: TextEditingController(
+                  text: _string(_profile?['email'], ''),
+                ),
+                readOnly: true,
+                decoration: const InputDecoration(
+                  labelText: 'Registered email',
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: location,
+                decoration: const InputDecoration(
+                  labelText: 'Office / location',
+                ),
+              ),
+              const SizedBox(height: 8),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Role: ${_string(_profile?['role'])}',
+                  style: const TextStyle(color: Colors.grey),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Save profile'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    await _runAction(() async {
+      _profile = await WebApiService.updateOfficerProfile(
+        fullName: name.text,
+        location: location.text,
+      );
+      await WebApiService.getOfficerProfile().then((value) {
+        _profile = value;
+      });
+    }, successMessage: 'Officer profile updated.');
+  }
+
+  Future<void> _employeeDialog({Map<String, dynamic>? employee}) async {
+    final editing = employee != null;
+    final code = TextEditingController(
+      text: _string(employee?['employee_code'], ''),
+    );
+    final name = TextEditingController(
+      text: _string(employee?['full_name'], ''),
+    );
+    final email = TextEditingController(text: _string(employee?['email'], ''));
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(editing ? 'Edit employee' : 'Add employee'),
+        content: SizedBox(
+          width: 440,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: code,
+                decoration: const InputDecoration(labelText: 'Employee ID'),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: name,
+                decoration: const InputDecoration(labelText: 'Full name'),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: email,
+                keyboardType: TextInputType.emailAddress,
+                decoration: const InputDecoration(labelText: 'Company email'),
+              ),
+              if (!editing) ...[
+                const SizedBox(height: 12),
+                const Text(
+                  'A temporary password will be emailed to the employee. '
+                  'They must change it on first login.',
+                ),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: Text(editing ? 'Save changes' : 'Create employee'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    await _runAction(
+      () async {
+        if (editing) {
+          await WebApiService.updateEmployee(
+            id: _intValue(employee['id']),
+            employeeCode: code.text,
+            fullName: name.text,
+            email: email.text,
+          );
+        } else {
+          await WebApiService.createEmployee(
+            employeeCode: code.text,
+            fullName: name.text,
+            email: email.text,
+          );
+        }
+        await _loadEmployees();
+      },
+      successMessage: editing
+          ? 'Employee details updated.'
+          : 'Employee created. Check the employee email delivery.',
+    );
+  }
+
+  Future<void> _setEmployeeActive(Map<String, dynamic> employee) async {
+    final currentlyActive = _active(employee['is_active']);
+    final activate = !currentlyActive;
+
+    final confirmed = await _confirm(
+      title: activate ? 'Activate employee' : 'Deactivate employee',
+      message:
+          'Are you sure you want to ${activate ? 'activate' : 'deactivate'} '
+          '${_string(employee['full_name'])}?',
+      action: activate ? 'Activate' : 'Deactivate',
+    );
+
+    if (!confirmed) return;
+
+    await _runAction(() async {
+      await WebApiService.setEmployeeStatus(
+        id: _intValue(employee['id']),
+        isActive: activate,
+      );
+      await _loadEmployees();
+      await _refreshIncident();
+    }, successMessage: 'Employee status updated.');
+  }
+
+  Future<void> _setVisitorActive(Map<String, dynamic> visitor) async {
+    final currentlyActive = _active(visitor['is_active']);
+    final activate = !currentlyActive;
+
+    if (activate) {
+      final rawExpiry = visitor['expires_at']?.toString() ?? '';
+      final parsedExpiry = DateTime.tryParse(rawExpiry);
+
+      final expiry = parsedExpiry == null
+          ? null
+          : (rawExpiry.endsWith('Z') ||
+                RegExp(r'[+-]\d{2}:\d{2}$').hasMatch(rawExpiry))
+          ? parsedExpiry.toUtc().add(const Duration(hours: 5, minutes: 30))
+          : parsedExpiry;
+
+      if (visitor['email_verified'] != true ||
+          expiry == null ||
+          !expiry.isAfter(
+            DateTime.now().toUtc().add(const Duration(hours: 5, minutes: 30)),
+          )) {
+        _showMessage(
+          'This visitor cannot be activated because their access has '
+          'expired or their email is not verified. They must sign in '
+          'again to renew their nine-hour access.',
+        );
+        return;
+      }
+    }
+
+    final confirmed = await _confirm(
+      title: activate ? 'Activate visitor' : 'Deactivate visitor',
+      message:
+          'Are you sure you want to ${activate ? 'activate' : 'deactivate'} '
+          '${_string(visitor['full_name'])}?',
+      action: activate ? 'Activate' : 'Deactivate',
+    );
+
+    if (!confirmed) return;
+
+    await _runAction(() async {
+      await WebApiService.setVisitorStatus(
+        id: _intValue(visitor['id']),
+        isActive: activate,
+      );
+      await _loadVisitors();
+      await _refreshIncident();
+    }, successMessage: 'Visitor status updated.');
+  }
+
+  Future<bool> _confirm({
+    required String title,
+    required String message,
+    required String action,
+  }) async {
+    return await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: Text(title),
+            content: Text(message),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(dialogContext, true),
+                child: Text(action),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+  }
+
+  void _showMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> _pickDate({required bool from}) async {
+    final selected = await showDatePicker(
+      context: context,
+      initialDate: (from ? _fromDate : _toDate) ?? DateTime.now(),
+      firstDate: DateTime(2000),
+      lastDate: DateTime(2100),
+    );
+
+    if (selected == null || !mounted) return;
+
+    setState(() {
+      if (from) {
+        _fromDate = selected;
+      } else {
+        _toDate = selected;
+      }
+    });
+  }
+
+  Future<void> _applyIncidentFilters() async {
+    if (_fromDate != null && _toDate != null && _fromDate!.isAfter(_toDate!)) {
+      setState(() => _error = 'From date must be on or before To date.');
+      return;
+    }
+
+    await _runAction(() async {
+      await _loadIncidents();
+    });
+  }
+
+  Future<void> _logout() async {
+    final confirmed = await _confirm(
+      title: 'Log out',
+      message: 'Do you want to log out of the Zentry officer dashboard?',
+      action: 'Log out',
+    );
+
+    if (!confirmed || !mounted) return;
+
+    await WebApiService.logout();
+
+    if (!mounted) return;
 
     Navigator.of(context).pushAndRemoveUntil(
       MaterialPageRoute(builder: (_) => const WebLogin()),
@@ -86,1659 +830,1428 @@ class _WebHomeState extends State<WebHome> {
     );
   }
 
-  Future<void> _refresh() async {
-    if (_busy) return;
-    _busy = true;
-
-    try {
-      final response = await http
-          .get(
-            Uri.parse('$api/incidents/active'),
-            headers: WebApiService.authHeaders,
-          )
-          .timeout(const Duration(seconds: 12));
-
-      if (response.statusCode != 200) {
-        throw Exception('Incident request failed: ${response.statusCode}');
-      }
-
-      final decoded = jsonDecode(response.body);
-      if (decoded is! List) {
-        throw Exception('Unexpected incident response.');
-      }
-
-      Map<String, dynamic>? active;
-
-      if (decoded.isNotEmpty) {
-        active = Map<String, dynamic>.from(decoded.first);
-      }
-
-      Map<String, dynamic> summary = {};
-      List<dynamic> responses = [];
-
-      if (active != null) {
-        final id = active['id'];
-
-        final results = await Future.wait([
-          http
-              .get(
-                Uri.parse('$api/incidents/$id/summary'),
-                headers: WebApiService.authHeaders,
-              )
-              .timeout(const Duration(seconds: 12)),
-          http
-              .get(
-                Uri.parse('$api/incidents/$id/responses'),
-                headers: WebApiService.authHeaders,
-              )
-              .timeout(const Duration(seconds: 12)),
-        ]);
-
-        if (results[0].statusCode == 200) {
-          final data = jsonDecode(results[0].body);
-          if (data is Map) {
-            summary = Map<String, dynamic>.from(data);
-          }
-        }
-
-        if (results[1].statusCode == 200) {
-          final data = jsonDecode(results[1].body);
-          if (data is List) {
-            responses = data;
-          }
-        }
-      }
-
-      if (!mounted) return;
-
-      setState(() {
-        _incident = active;
-        _summary = summary;
-        _responses = responses;
-        _error = null;
-        _loading = false;
-      });
-    } catch (error) {
-      if (!mounted) return;
-
-      setState(() {
-        _error = error.toString().contains('log in')
-            ? 'Your session may have expired. Please log in again.'
-            : 'Cannot connect to the Zentry API. Check that the backend is running.';
-        _loading = false;
-      });
-    } finally {
-      _busy = false;
-    }
-  }
-
-  Future<void> _startIncident() async {
-    if (_busy) return;
-
-    setState(() => _busy = true);
-
-    try {
-      final response = await http
-          .post(
-            Uri.parse('$api/incidents'),
-            headers: WebApiService.authHeaders,
-            body: jsonEncode({
-              'title': 'Fire Alarm',
-              'message': 'Evacuate now - North Car Parking',
-              'location': 'Mumbai Office - Floor 3',
-              'created_by': 'Suresh',
-            }),
-          )
-          .timeout(const Duration(seconds: 15));
-
-      if (!mounted) return;
-
-      if (response.statusCode == 201) {
-        final data = jsonDecode(response.body);
-        _showMessage('Incident #${data['id']} created.');
-      } else if (response.statusCode == 409) {
-        _showMessage('An incident is already active.');
-      } else {
-        _showMessage('Could not start incident (${response.statusCode}).');
-      }
-    } catch (_) {
-      if (mounted) _showMessage('Cannot connect to the Zentry API.');
-    } finally {
-      _busy = false;
-      await _refresh();
-    }
-  }
-
-  Future<void> _clearIncident() async {
-    final incident = _incident;
-    if (incident == null || _busy) return;
-
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Issue All Clear?'),
-        content: const Text(
-          'Confirm that the incident has been assessed and that it is '
-          'appropriate to mark it cleared.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext, false),
-            child: const Text('CANCEL'),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: _green),
-            onPressed: () => Navigator.pop(dialogContext, true),
-            child: const Text('CONFIRM ALL CLEAR'),
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFF4F6FA),
+      body: Row(
+        children: [
+          _buildSidebar(),
+          Expanded(
+            child: Column(
+              children: [
+                _buildTopBar(),
+                if (_error != null) _messageBanner(_error!, isError: true),
+                if (_notice != null) _messageBanner(_notice!, isError: false),
+                if (_loading) const LinearProgressIndicator(minHeight: 2),
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: _buildPage(),
+                  ),
+                ),
+              ],
+            ),
           ),
         ],
       ),
     );
+  }
 
-    if (confirmed != true || !mounted) return;
+  void _selectSidebarPage(String page) {
+    setState(() {
+      _page = page;
+      _error = null;
+      _notice = null;
+    });
 
-    setState(() => _busy = true);
-
-    try {
-      final response = await http
-          .post(
-            Uri.parse('$api/incidents/${incident['id']}/clear'),
-            headers: WebApiService.authHeaders,
-          )
-          .timeout(const Duration(seconds: 15));
-
-      if (!mounted) return;
-
-      if (response.statusCode == 200) {
-        _showMessage('Incident marked as cleared.');
-      } else {
-        _showMessage('Unable to clear incident (${response.statusCode}).');
-      }
-    } catch (_) {
-      if (mounted) _showMessage('Cannot connect to the Zentry API.');
-    } finally {
-      _busy = false;
-      await _refresh();
+    switch (page) {
+      case 'Employees':
+        _loadEmployees();
+        break;
+      case 'Visitors':
+        _loadVisitors();
+        break;
+      case 'Incidents':
+        _loadIncidents();
+        break;
+      case 'Requires Action':
+        _refreshIncident();
+        break;
+      case 'Dashboard':
+        _refreshIncident(silent: true);
+        break;
     }
   }
 
-  Future<void> _showCreateEmployeeDialog() async {
-    final result = await showDialog<String>(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => const _CreateEmployeeDialog(),
-    );
-
-    if (result != null && mounted) {
-      _showMessage(result);
-    }
-  }
-
-  void _showMessage(String message) {
-    if (!mounted) return;
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
-    );
-  }
-
-  int _count(String key) {
-    final value = _summary[key];
-    if (value is int) return value;
-    return int.tryParse('$value') ?? 0;
-  }
-
-  int _statusCount(String status) {
-    return _responses.where((item) {
-      if (item is! Map) return false;
-      return '${item['response_status']}' == status;
-    }).length;
-  }
-
-  String _statusLabel(String status) {
-    switch (status) {
-      case 'SAFE_AT_ASSEMBLY':
-        return 'AT ASSEMBLY';
-      case 'SAFE_OUTSIDE':
-        return 'SAFE OUTSIDE';
-      case 'SAFE_INSIDE':
-        return 'SAFE INSIDE';
-      case 'NEED_HELP':
-        return 'HELP REQUESTED';
-      default:
-        return status.replaceAll('_', ' ');
-    }
-  }
-
-  Color _statusColor(String status) {
-    switch (status) {
-      case 'SAFE_AT_ASSEMBLY':
-        return _green;
-      case 'SAFE_OUTSIDE':
-        return _blue;
-      case 'SAFE_INSIDE':
-        return _amber;
-      case 'NEED_HELP':
-        return _red;
-      default:
-        return _mutedText;
-    }
-  }
-
-  IconData _statusIcon(String status) {
-    switch (status) {
-      case 'SAFE_AT_ASSEMBLY':
-        return Icons.check_circle_outline;
-      case 'SAFE_OUTSIDE':
-        return Icons.location_on_outlined;
-      case 'SAFE_INSIDE':
-        return Icons.warning_amber_rounded;
-      case 'NEED_HELP':
-        return Icons.sos_rounded;
-      default:
-        return Icons.person_outline;
-    }
-  }
-
-  String _time(dynamic value) {
-    if (value == null) return 'Time unavailable';
-
-    final date = DateTime.tryParse(value.toString())?.toLocal();
-    if (date == null) return 'Time unavailable';
-
-    return '${date.day.toString().padLeft(2, '0')}/'
-        '${date.month.toString().padLeft(2, '0')}/'
-        '${date.year} '
-        '${date.hour.toString().padLeft(2, '0')}:'
-        '${date.minute.toString().padLeft(2, '0')}';
-  }
-
-  String _responseTimestamp(Map<String, dynamic> item) {
-    final value =
-        item['created_at'] ??
-        item['responded_at'] ??
-        item['updated_at'] ??
-        item['timestamp'];
-
-    return _time(value);
-  }
-
-  List<dynamic> get _filteredResponses {
-    final statusForFilter = {
-      'HELP REQUESTED': 'NEED_HELP',
-      'SAFE INSIDE': 'SAFE_INSIDE',
-      'AT ASSEMBLY': 'SAFE_AT_ASSEMBLY',
-      'SAFE OUTSIDE': 'SAFE_OUTSIDE',
-    };
-
-    if (_selectedFilter == 'ALL RESPONSES') {
-      return _responses;
-    }
-
-    if (_selectedFilter == 'EXPECTED' || _selectedFilter == 'NO RESPONSE') {
-      // The current responses endpoint only returns submitted responses.
-      // A complete expected/no-response list needs an employee roster API.
-      return _responses.where((item) {
-        if (item is! Map) return false;
-        final status = '${item['response_status'] ?? ''}';
-        return status.isEmpty || status == 'NO_RESPONSE';
-      }).toList();
-    }
-
-    final status = statusForFilter[_selectedFilter];
-    if (status == null) return _responses;
-
-    return _responses.where((item) {
-      if (item is! Map) return false;
-      return '${item['response_status'] ?? ''}' == status;
-    }).toList();
-  }
-
-  int _filterCount(String filter) {
-    switch (filter) {
-      case 'HELP REQUESTED':
-        return _count('help_requested') != 0
-            ? _count('help_requested')
-            : _statusCount('NEED_HELP');
-      case 'SAFE INSIDE':
-        return _statusCount('SAFE_INSIDE');
-      case 'AT ASSEMBLY':
-        return _count('at_assembly') != 0
-            ? _count('at_assembly')
-            : _statusCount('SAFE_AT_ASSEMBLY');
-      case 'SAFE OUTSIDE':
-        return _statusCount('SAFE_OUTSIDE');
-      case 'NO RESPONSE':
-        return _count('no_response');
-      case 'EXPECTED':
-        return _count('expected');
-      default:
-        return _responses.length;
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final isWide = MediaQuery.sizeOf(context).width >= 950;
-
-    return Scaffold(
-      backgroundColor: _pageBackground,
-      body: SafeArea(
-        child: Row(
-          children: [
-            if (isWide || _sidebarExpanded) _buildSidebar(isWide: isWide),
-            Expanded(
-              child: Column(
-                children: [
-                  _buildTopBar(isWide: isWide),
-                  if (_error != null) _buildErrorBanner(),
-                  Expanded(
-                    child: _loading
-                        ? const Center(child: CircularProgressIndicator())
-                        : RefreshIndicator(
-                            onRefresh: _refresh,
-                            child: _buildCurrentPage(),
-                          ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
+  Widget _sidebarLogo() {
+    return Container(
+      width: 44,
+      height: 44,
+      padding: const EdgeInsets.all(4),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(10),
       ),
+      child: Image.asset('assets/images/zentry_logo.png', fit: BoxFit.contain),
     );
   }
 
-  Widget _buildSidebar({required bool isWide}) {
-    final expanded = isWide ? _sidebarExpanded : true;
+  Widget _buildSidebar() {
+    const items = [
+      ('Dashboard', Icons.dashboard_outlined),
+      ('Employees', Icons.people_outline),
+      ('Visitors', Icons.badge_outlined),
+      ('Incidents', Icons.history),
+      ('Requires Action', Icons.warning_amber_outlined),
+    ];
 
     return AnimatedContainer(
-      duration: const Duration(milliseconds: 200),
-      width: expanded ? 248 : 76,
-      color: _navy,
+      duration: const Duration(milliseconds: 220),
+      curve: Curves.easeInOut,
+      width: _sidebarCollapsed ? 76 : 230,
+      color: const Color(0xFF14243A),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Padding(
             padding: EdgeInsets.symmetric(
-              horizontal: expanded ? 20 : 12,
+              horizontal: _sidebarCollapsed ? 16 : 18,
               vertical: 22,
             ),
-            child: Row(
-              children: [
-                Container(
-                  width: 42,
-                  height: 42,
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  padding: const EdgeInsets.all(4),
-                  child: Image.asset(
-                    'assets/images/zentry_logo.png',
-                    fit: BoxFit.contain,
-                  ),
-                ),
-                if (expanded) ...[
-                  const SizedBox(width: 12),
-                  const Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
+            child: _sidebarCollapsed
+                ? Center(child: _sidebarLogo())
+                : Row(
+                    children: [
+                      _sidebarLogo(),
+                      const SizedBox(width: 10),
+                      const Expanded(
+                        child: Text(
                           'ZENTRY',
+                          overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                             color: Colors.white,
-                            fontSize: 19,
-                            fontWeight: FontWeight.w800,
-                            letterSpacing: 1.1,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 21,
+                            letterSpacing: 1.4,
                           ),
                         ),
-                        SizedBox(height: 3),
-                        Text(
-                          'SAFETY OPERATIONS',
-                          style: TextStyle(
-                            color: Color(0xFFB9C7D9),
-                            fontSize: 9,
-                            letterSpacing: 1.1,
-                          ),
-                        ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
-                ],
-              ],
-            ),
           ),
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 18),
-            child: Divider(color: Color(0xFF35445A), height: 1),
-          ),
-          const SizedBox(height: 18),
-          _navItem(
-            title: 'Dashboard',
-            icon: Icons.grid_view_rounded,
-            expanded: expanded,
-          ),
-          _navItem(
-            title: 'Employees',
-            icon: Icons.groups_2_outlined,
-            expanded: expanded,
-          ),
-          _navItem(
-            title: 'Visitors',
-            icon: Icons.badge_outlined,
-            expanded: expanded,
-          ),
-          _navItem(
-            title: 'Incidents',
-            icon: Icons.emergency_outlined,
-            expanded: expanded,
-          ),
-          _navItem(
-            title: 'Requires Action',
-            icon: Icons.fact_check_outlined,
-            expanded: expanded,
-            badge: _count('help_requested'),
-          ),
-          const Spacer(),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: Divider(color: Colors.white.withValues(alpha: 0.15)),
-          ),
-          if (expanded)
-            const Padding(
-              padding: EdgeInsets.fromLTRB(20, 8, 20, 16),
-              child: Text(
-                'SAFETY MANAGEMENT PORTAL',
-                style: TextStyle(
-                  color: Color(0xFF9AAAC0),
-                  fontSize: 9,
-                  letterSpacing: 1,
-                ),
+
+          const Divider(color: Colors.white24, height: 1),
+          const SizedBox(height: 12),
+          for (final item in items)
+            Padding(
+              padding: EdgeInsets.symmetric(
+                horizontal: _sidebarCollapsed ? 8 : 10,
+                vertical: 3,
+              ),
+              child: Tooltip(
+                message: _sidebarCollapsed ? item.$1 : '',
+                child: _sidebarCollapsed
+                    ? InkWell(
+                        borderRadius: BorderRadius.circular(8),
+                        onTap: () => _selectSidebarPage(item.$1),
+                        child: Container(
+                          height: 46,
+                          width: double.infinity,
+                          decoration: BoxDecoration(
+                            color: _page == item.$1
+                                ? const Color(0xFF2C4260)
+                                : Colors.transparent,
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: Center(
+                            child: Icon(
+                              item.$2,
+                              color: Colors.white70,
+                              size: 22,
+                            ),
+                          ),
+                        ),
+                      )
+                    : ListTile(
+                        dense: true,
+                        minTileHeight: 46,
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 2,
+                        ),
+                        selected: _page == item.$1,
+                        selectedTileColor: const Color(0xFF2C4260),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        leading: Icon(item.$2, color: Colors.white70, size: 22),
+                        title: Text(
+                          item.$1,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(color: Colors.white),
+                        ),
+                        onTap: () => _selectSidebarPage(item.$1),
+                      ),
               ),
             ),
-          ListTile(
-            dense: true,
-            leading: const Icon(Icons.logout_rounded, color: Colors.white70),
-            title: expanded
-                ? const Text('Log out', style: TextStyle(color: Colors.white70))
-                : null,
-            onTap: _logout,
-            horizontalTitleGap: 10,
+          const Spacer(),
+          const Divider(color: Colors.white24, height: 1),
+          Padding(
+            padding: EdgeInsets.symmetric(
+              horizontal: _sidebarCollapsed ? 8 : 10,
+              vertical: 8,
+            ),
+            child: Tooltip(
+              message: _sidebarCollapsed ? 'Logout' : '',
+              child: _sidebarCollapsed
+                  ? InkWell(
+                      borderRadius: BorderRadius.circular(8),
+                      onTap: _logout,
+                      child: const SizedBox(
+                        height: 46,
+                        width: double.infinity,
+                        child: Center(
+                          child: Icon(
+                            Icons.logout,
+                            color: Colors.white70,
+                            size: 22,
+                          ),
+                        ),
+                      ),
+                    )
+                  : ListTile(
+                      dense: true,
+                      minTileHeight: 46,
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 2,
+                      ),
+                      leading: const Icon(
+                        Icons.logout,
+                        color: Colors.white70,
+                        size: 22,
+                      ),
+                      title: const Text(
+                        'Logout',
+                        style: TextStyle(color: Colors.white),
+                      ),
+                      onTap: _logout,
+                    ),
+            ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
         ],
       ),
     );
   }
 
-  Widget _navItem({
-    required String title,
-    required IconData icon,
-    required bool expanded,
-    int? badge,
-  }) {
-    final selected = _selectedPage == title;
-
-    return Padding(
-      padding: EdgeInsets.fromLTRB(expanded ? 12 : 8, 3, expanded ? 12 : 8, 3),
-      child: Tooltip(
-        message: expanded ? '' : title,
-        child: Material(
-          color: selected ? const Color(0xFF31425C) : Colors.transparent,
-          borderRadius: BorderRadius.circular(10),
-          child: InkWell(
-            borderRadius: BorderRadius.circular(10),
-            onTap: () {
-              setState(() {
-                _selectedPage = title;
-                if (!MediaQuery.sizeOf(context).width.isFinite) return;
-                if (MediaQuery.sizeOf(context).width < 950) {
-                  _sidebarExpanded = false;
-                }
-              });
-            },
-            child: Padding(
-              padding: EdgeInsets.symmetric(
-                horizontal: expanded ? 12 : 10,
-                vertical: 13,
-              ),
-              child: Row(
-                children: [
-                  Icon(
-                    icon,
-                    color: selected ? Colors.white : const Color(0xFFC5D0DF),
-                    size: 21,
-                  ),
-                  if (expanded) ...[
-                    const SizedBox(width: 13),
-                    Expanded(
-                      child: Text(
-                        title,
-                        style: TextStyle(
-                          color: selected
-                              ? Colors.white
-                              : const Color(0xFFD6DFEA),
-                          fontWeight: selected
-                              ? FontWeight.w600
-                              : FontWeight.w400,
-                          fontSize: 13,
-                        ),
-                      ),
-                    ),
-                    if (badge != null && badge > 0)
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 7,
-                          vertical: 3,
-                        ),
-                        decoration: BoxDecoration(
-                          color: _red,
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: Text(
-                          '$badge',
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 10,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ),
-                  ],
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildTopBar({required bool isWide}) {
+  Widget _buildTopBar() {
     return Container(
       height: 72,
-      padding: const EdgeInsets.symmetric(horizontal: 24),
-      decoration: const BoxDecoration(
-        color: Colors.white,
-        border: Border(bottom: BorderSide(color: _borderColor)),
-      ),
+      padding: const EdgeInsets.symmetric(horizontal: 20),
+      color: Colors.white,
       child: Row(
         children: [
           IconButton(
-            tooltip: 'Toggle sidebar',
             onPressed: () {
-              setState(() => _sidebarExpanded = !_sidebarExpanded);
+              setState(() {
+                _sidebarCollapsed = !_sidebarCollapsed;
+              });
             },
-            icon: const Icon(Icons.menu_rounded, color: _navy),
+            icon: const Icon(Icons.menu_rounded),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: 8),
           Expanded(
             child: Text(
-              _selectedPage,
-              style: const TextStyle(
-                color: _navy,
-                fontSize: 19,
-                fontWeight: FontWeight.w700,
-              ),
-              overflow: TextOverflow.ellipsis,
+              _page,
+              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
             ),
           ),
-          if (isWide)
-            const Padding(
-              padding: EdgeInsets.only(right: 18),
+          InkWell(
+            borderRadius: BorderRadius.circular(10),
+            onTap: _editProfileDialog,
+            child: Padding(
+              padding: const EdgeInsets.all(8),
               child: Row(
                 children: [
-                  Icon(Icons.location_on_outlined, color: _mutedText, size: 18),
-                  SizedBox(width: 5),
-                  Text(
-                    'Mumbai Office',
-                    style: TextStyle(color: _mutedText, fontSize: 12),
+                  const CircleAvatar(
+                    radius: 18,
+                    child: Icon(Icons.person_outline, size: 20),
                   ),
+                  const SizedBox(width: 10),
+                  Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _string(_profile?['full_name'], 'Safety Officer'),
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      Text(
+                        '${_string(_profile?['role'])} · '
+                        '${_string(_profile?['location'], 'Location not set')}',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: Colors.black54,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(width: 4),
+                  const Icon(Icons.edit_outlined, size: 15),
                 ],
               ),
             ),
-          OutlinedButton.icon(
-            onPressed: _busy ? null : _showCreateEmployeeDialog,
-            icon: const Icon(Icons.person_add_alt_1, size: 17),
-            label: const Text('Add Employee'),
-            style: OutlinedButton.styleFrom(
-              foregroundColor: _navy,
-              side: const BorderSide(color: _borderColor),
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 15),
-            ),
-          ),
-          const SizedBox(width: 10),
-          IconButton(
-            tooltip: 'Refresh dashboard',
-            onPressed: _refresh,
-            icon: const Icon(Icons.refresh_rounded, color: _mutedText),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildErrorBanner() {
+  Widget _messageBanner(String message, {required bool isError}) {
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-      color: const Color(0xFFFFF1E6),
+      color: isError ? const Color(0xFFFFE7E7) : const Color(0xFFE4F7E9),
+      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
       child: Row(
         children: [
-          const Icon(Icons.warning_amber_rounded, color: _amber),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              _error!,
-              style: const TextStyle(color: Color(0xFF874B00), fontSize: 12),
-            ),
+          Icon(
+            isError ? Icons.error_outline : Icons.check_circle_outline,
+            color: isError ? Colors.red.shade800 : Colors.green.shade800,
           ),
-          TextButton(onPressed: _refresh, child: const Text('RETRY')),
+          const SizedBox(width: 10),
+          Expanded(child: Text(message)),
+          IconButton(
+            onPressed: () => setState(() {
+              _error = null;
+              _notice = null;
+            }),
+            icon: const Icon(Icons.close, size: 18),
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildCurrentPage() {
-    switch (_selectedPage) {
-      case 'Dashboard':
-        return _buildDashboard();
-      case 'Requires Action':
-        return _buildRequiresActionPage();
+  Widget _buildPage() {
+    switch (_page) {
+      case 'Employees':
+        return _buildEmployeesPage();
+      case 'Visitors':
+        return _buildVisitorsPage();
       case 'Incidents':
         return _buildIncidentsPage();
-      case 'Employees':
-        return _buildManagementPlaceholder(
-          title: 'Employee Management',
-          subtitle: 'Create and manage employee access to Zentry.',
-          icon: Icons.groups_2_outlined,
-          details: const [
-            'Create employee accounts',
-            'Review employee safety responses during an incident',
-            'Employee activation, editing and password management require additional backend endpoints',
-          ],
-          actionLabel: 'Add Employee',
-          onAction: _showCreateEmployeeDialog,
-        );
-      case 'Visitors':
-        return _buildManagementPlaceholder(
-          title: 'Visitor Management',
-          subtitle: 'Visitor access and emergency readiness.',
-          icon: Icons.badge_outlined,
-          details: const [
-            'Visitor records and VRF IDs',
-            'Email OTP verification',
-            'Automatic visitor account expiry',
-            'These features will connect to the visitor API when implemented',
-          ],
-        );
+      case 'Requires Action':
+        return _buildActionPage();
       default:
-        return _buildDashboard();
+        return _buildDashboardPage();
     }
   }
 
-  Widget _buildDashboard() {
-    final active = _incident != null;
+  Widget _buildDashboardPage() {
+    final hasIncident = _incident != null;
 
     return ListView(
-      padding: const EdgeInsets.all(24),
       children: [
         Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Safety overview',
-                    style: TextStyle(
-                      fontSize: 25,
-                      fontWeight: FontWeight.w800,
-                      color: _navy,
-                    ),
-                  ),
-                  SizedBox(height: 6),
-                  Text(
-                    'Monitor personnel safety and incident response in real time.',
-                    style: TextStyle(color: _mutedText, fontSize: 13),
-                  ),
-                ],
+              child: Text(
+                'Emergency Command Center',
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
               ),
             ),
-            const SizedBox(width: 12),
-            _systemStatusPill(active),
+            if (hasIncident)
+              FilledButton.icon(
+                style: FilledButton.styleFrom(
+                  backgroundColor: Colors.red.shade700,
+                ),
+                onPressed: _clearIncidentDialog,
+                icon: const Icon(Icons.check_circle_outline),
+                label: const Text('Issue All Clear'),
+              )
+            else
+              FilledButton.icon(
+                style: FilledButton.styleFrom(
+                  backgroundColor: Colors.red.shade700,
+                ),
+                onPressed: _createIncidentDialog,
+                icon: const Icon(Icons.campaign_outlined),
+                label: const Text('Start Emergency'),
+              ),
           ],
         ),
         const SizedBox(height: 22),
-        _buildIncidentBanner(active),
-        const SizedBox(height: 22),
-        LayoutBuilder(
-          builder: (context, constraints) {
-            final columns = constraints.maxWidth >= 1200
-                ? 6
-                : constraints.maxWidth >= 800
-                ? 3
-                : constraints.maxWidth >= 500
-                ? 2
-                : 1;
-
-            return GridView.count(
-              crossAxisCount: columns,
-              crossAxisSpacing: 12,
-              mainAxisSpacing: 12,
-              childAspectRatio: columns == 1 ? 4.0 : 1.35,
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              children: [
-                _statCard(
-                  title: 'Expected',
-                  count: _count('expected'),
-                  icon: Icons.groups_outlined,
-                  color: const Color(0xFF53657D),
-                  filter: 'EXPECTED',
-                ),
-                _statCard(
-                  title: 'At Assembly',
-                  count: _count('at_assembly'),
-                  icon: Icons.check_circle_outline,
-                  color: _green,
-                  filter: 'AT ASSEMBLY',
-                ),
-                _statCard(
-                  title: 'Safe Outside',
-                  count: _statusCount('SAFE_OUTSIDE') != 0
-                      ? _statusCount('SAFE_OUTSIDE')
-                      : _count('safe_elsewhere'),
-                  icon: Icons.location_on_outlined,
-                  color: _blue,
-                  filter: 'SAFE OUTSIDE',
-                ),
-                _statCard(
-                  title: 'Safe Inside',
-                  count: _statusCount('SAFE_INSIDE'),
-                  icon: Icons.warning_amber_rounded,
-                  color: _amber,
-                  filter: 'SAFE INSIDE',
-                ),
-                _statCard(
-                  title: 'Help Requested',
-                  count: _count('help_requested') != 0
-                      ? _count('help_requested')
-                      : _statusCount('NEED_HELP'),
-                  icon: Icons.sos_rounded,
-                  color: _red,
-                  filter: 'HELP REQUESTED',
-                ),
-                _statCard(
-                  title: 'No Response',
-                  count: _count('no_response'),
-                  icon: Icons.schedule_rounded,
-                  color: _purple,
-                  filter: 'NO RESPONSE',
-                ),
-              ],
-            );
-          },
-        ),
-        const SizedBox(height: 24),
-        LayoutBuilder(
-          builder: (context, constraints) {
-            if (constraints.maxWidth < 850) {
-              return Column(
+        if (!hasIncident)
+          _panel(
+            child: const Padding(
+              padding: EdgeInsets.all(24),
+              child: Column(
                 children: [
-                  _buildRequiresActionCard(),
-                  const SizedBox(height: 18),
-                  _buildIncidentDetailsCard(),
+                  Icon(
+                    Icons.verified_user_outlined,
+                    size: 48,
+                    color: Colors.green,
+                  ),
+                  SizedBox(height: 12),
+                  Text(
+                    'No active emergency',
+                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                  ),
+                  SizedBox(height: 6),
+                  Text('Start an incident when an emergency is confirmed.'),
                 ],
-              );
-            }
+              ),
+            ),
+          )
+        else ...[
+          _incidentHeader(),
+          const SizedBox(height: 18),
 
-            return Row(
+
+LayoutBuilder(
+  builder: (context, constraints) {
+    const cardHeight = 100.0;
+    const spacing = 12.0;
+    const minCardWidth = 308.0;
+
+    final columns = ((constraints.maxWidth + spacing) /
+            (minCardWidth + spacing))
+        .floor()
+        .clamp(1, 6);
+
+    return GridView.count(
+      crossAxisCount: columns,
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      crossAxisSpacing: spacing,
+      mainAxisSpacing: spacing,
+childAspectRatio:
+    (constraints.maxWidth - (columns - 1) * spacing) /
+    columns /
+    cardHeight,
+      children: [
+        _metricCard(
+          'Expected people',
+          _summary['expected'],
+          Icons.groups_outlined,
+          const Color(0xFF315D9D),
+        ),
+        _metricCard(
+          'At assembly',
+          _summary['at_assembly'],
+          Icons.groups,
+          Colors.green.shade700,
+        ),
+        _metricCard(
+          'Safe outside',
+          _summary['safe_elsewhere'],
+          Icons.directions_walk,
+          Colors.teal.shade700,
+        ),
+        _metricCard(
+          'Still inside',
+          _summary['safe_inside'],
+          Icons.meeting_room_outlined,
+          Colors.orange.shade800,
+        ),
+        _metricCard(
+          'Help requested',
+          _summary['help_requested'],
+          Icons.health_and_safety_outlined,
+          Colors.red.shade700,
+        ),
+        _metricCard(
+          'No response',
+          _summary['no_response'],
+          Icons.person_search_outlined,
+          Colors.deepOrange.shade700,
+        ),
+      ],
+    );
+  },
+),
+
+          const SizedBox(height: 20),
+
+          _panel(
+            child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Expanded(flex: 7, child: _buildRequiresActionCard()),
-                const SizedBox(width: 18),
-                Expanded(flex: 4, child: _buildIncidentDetailsCard()),
+                const Text(
+                  'People status',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '${_summary['safe_confirmed'] ?? 0} of '
+                  '${_summary['expected'] ?? 0} people have confirmed a '
+                  'safe evacuation status.',
+                ),
+                const SizedBox(height: 18),
+                _peopleFilterBar(),
+                const SizedBox(height: 14),
+                Builder(
+                  builder: (context) {
+                    final filteredPeople = _filterPeople(_people);
+
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Showing ${filteredPeople.length} of '
+                          '${_people.length} expected people',
+                          style: const TextStyle(
+                            color: Colors.black54,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        _peopleTable(filteredPeople),
+                      ],
+                    );
+                  },
+                ),
               ],
-            );
-          },
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _incidentHeader() {
+    final incident = _incident!;
+
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFF0F0),
+        border: Border.all(color: const Color(0xFFFFC5C5)),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.warning_amber, color: Colors.red.shade800, size: 34),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'ACTIVE INCIDENT #${incident['id']} · '
+                  '${_string(incident['title'])}',
+                  style: TextStyle(
+                    color: Colors.red.shade900,
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(_string(incident['message'])),
+                const SizedBox(height: 6),
+                Text('Location: ${_string(incident['location'])}'),
+                Text('Triggered by: ${_string(incident['created_by'])}'),
+                Text('Started: ${_date(incident['created_at'])}'),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _metricCard(String label, dynamic value, IconData icon, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFFE5E9F0)),
+      ),
+      child: Row(
+        children: [
+          CircleAvatar(
+            radius: 19,
+            backgroundColor: color.withValues(alpha: 0.12),
+            child: Icon(icon, color: color, size: 20),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  _string(value, '0'),
+                  style: const TextStyle(
+                    fontSize: 22,
+                    fontWeight: FontWeight.bold,
+                    height: 1.1,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  label,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.black54, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEmployeesPage() {
+    final query = _searchController.text.toLowerCase();
+    final list = _employees.where((employee) {
+      final content = [
+        employee['full_name'],
+        employee['employee_code'],
+        employee['email'],
+      ].join(' ').toLowerCase();
+      return content.contains(query);
+    }).toList();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                'Employees (${_employees.length})',
+                style: const TextStyle(
+                  fontSize: 21,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+            FilledButton.icon(
+              onPressed: () => _employeeDialog(),
+              icon: const Icon(Icons.person_add_alt_1),
+              label: const Text('Add Employee'),
+            ),
+          ],
         ),
-        const SizedBox(height: 20),
-        const Text(
-          'Dashboard data refreshes automatically every 4 seconds.',
-          style: TextStyle(color: _mutedText, fontSize: 11),
+        const SizedBox(height: 14),
+        _searchField('Search name, employee ID or email'),
+        const SizedBox(height: 14),
+        Expanded(
+          child: _panel(
+            child: list.isEmpty
+                ? const Center(child: Text('No employees found.'))
+                : SingleChildScrollView(
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: DataTable(
+                        columns: const [
+                          DataColumn(label: Text('Employee ID')),
+                          DataColumn(label: Text('Name')),
+                          DataColumn(label: Text('Email')),
+                          DataColumn(label: Text('Account')),
+                          DataColumn(label: Text('Password')),
+                          DataColumn(label: Text('Actions')),
+                        ],
+                        rows: list.map((employee) {
+                          final active = _active(employee['is_active']);
+                          return DataRow(
+                            cells: [
+                              DataCell(
+                                Text(_string(employee['employee_code'])),
+                              ),
+                              DataCell(Text(_string(employee['full_name']))),
+                              DataCell(Text(_string(employee['email']))),
+                              DataCell(
+                                _statusChip(active ? 'ACTIVE' : 'INACTIVE'),
+                              ),
+                              DataCell(
+                                Text(
+                                  _active(employee['password_reset_required'])
+                                      ? 'Reset required'
+                                      : 'Set',
+                                ),
+                              ),
+                              DataCell(
+                                Row(
+                                  children: [
+                                    IconButton(
+                                      tooltip: 'Edit employee',
+                                      onPressed: () =>
+                                          _employeeDialog(employee: employee),
+                                      icon: const Icon(Icons.edit_outlined),
+                                    ),
+                                    TextButton(
+                                      onPressed: () =>
+                                          _setEmployeeActive(employee),
+                                      child: Text(
+                                        active ? 'Deactivate' : 'Activate',
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          );
+                        }).toList(),
+                      ),
+                    ),
+                  ),
+          ),
         ),
       ],
     );
   }
 
-  Widget _systemStatusPill(bool active) {
-    final color = active ? _red : _green;
+  Widget _buildVisitorsPage() {
+    final query = _searchController.text.toLowerCase();
+    final list = _visitors.where((visitor) {
+      final content = [
+        visitor['full_name'],
+        visitor['vrf_id'],
+        visitor['email'],
+      ].join(' ').toLowerCase();
+      return content.contains(query);
+    }).toList();
 
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(24),
-        border: Border.all(color: color.withValues(alpha: 0.25)),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 7,
-            height: 7,
-            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            active ? 'INCIDENT ACTIVE' : 'NO ACTIVE INCIDENT',
-            style: TextStyle(
-              color: color,
-              fontSize: 10,
-              fontWeight: FontWeight.w800,
-              letterSpacing: 0.5,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildIncidentBanner(bool active) {
-    return Container(
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        color: active ? const Color(0xFFFFF1F0) : Colors.white,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-          color: active ? const Color(0xFFF4C7C4) : _borderColor,
-        ),
-      ),
-      child: Row(
-        children: [
-          Container(
-            width: 46,
-            height: 46,
-            decoration: BoxDecoration(
-              color: active ? const Color(0xFFFBDAD7) : const Color(0xFFE8F5EF),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Icon(
-              active ? Icons.campaign_rounded : Icons.shield_outlined,
-              color: active ? _red : _green,
-              size: 25,
-            ),
-          ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  active
-                      ? 'INCIDENT #${_incident!['id']} · ${_incident!['title'] ?? 'Active incident'}'
-                      : 'Your site is not reporting an active incident',
-                  style: const TextStyle(
-                    color: _navy,
-                    fontWeight: FontWeight.w700,
-                    fontSize: 14,
-                  ),
-                ),
-                const SizedBox(height: 5),
-                Text(
-                  active
-                      ? '${_incident!['message'] ?? ''} · ${_incident!['location'] ?? 'Location not specified'}'
-                      : 'Start an incident when emergency coordination is required.',
-                  style: const TextStyle(color: _mutedText, fontSize: 12),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 12),
-          if (active)
-            FilledButton.icon(
-              onPressed: _busy ? null : _clearIncident,
-              icon: const Icon(Icons.verified_outlined, size: 17),
-              label: const Text('Issue All Clear'),
-              style: FilledButton.styleFrom(
-                backgroundColor: _green,
-                foregroundColor: Colors.white,
-              ),
-            )
-          else
-            FilledButton.icon(
-              onPressed: _busy ? null : _startIncident,
-              icon: const Icon(Icons.add_alert_rounded, size: 17),
-              label: const Text('Start Incident'),
-              style: FilledButton.styleFrom(
-                backgroundColor: _red,
-                foregroundColor: Colors.white,
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _statCard({
-    required String title,
-    required int count,
-    required IconData icon,
-    required Color color,
-    required String filter,
-  }) {
-    final selected = _selectedFilter == filter;
-
-    return Material(
-      color: Colors.white,
-      borderRadius: BorderRadius.circular(14),
-      child: InkWell(
-        onTap: () {
-          setState(() {
-            _selectedFilter = filter;
-            _selectedPage = 'Requires Action';
-          });
-        },
-        borderRadius: BorderRadius.circular(14),
-        child: Container(
-          padding: const EdgeInsets.all(15),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(
-              color: selected ? color : _borderColor,
-              width: selected ? 1.5 : 1,
-            ),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      title,
-                      style: const TextStyle(
-                        color: _mutedText,
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ),
-                  Icon(icon, color: color, size: 20),
-                ],
-              ),
-              Text(
-                '$count',
-                style: TextStyle(
-                  color: color,
-                  fontSize: 29,
-                  fontWeight: FontWeight.w800,
-                  height: 1.1,
-                ),
-              ),
-              Text(
-                'View people  →',
-                style: TextStyle(
-                  color: selected ? color : _mutedText,
-                  fontSize: 10,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _panel({
-    required String title,
-    required Widget child,
-    Widget? trailing,
-  }) {
-    return Container(
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: _borderColor),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Expanded(
-                child: Text(
-                  title,
-                  style: const TextStyle(
-                    color: _navy,
-                    fontSize: 15,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-              ),
-              ?trailing,
-            ],
-          ),
-          const SizedBox(height: 16),
-          child,
-        ],
-      ),
-    );
-  }
-
-  Widget _buildRequiresActionCard() {
-    final filters = [
-      'HELP REQUESTED',
-      'SAFE INSIDE',
-      'NO RESPONSE',
-      'EXPECTED',
-      'AT ASSEMBLY',
-      'SAFE OUTSIDE',
-      'ALL RESPONSES',
-    ];
-
-    return _panel(
-      title: 'Requires Action',
-      trailing: Text(
-        '${_filteredResponses.length} shown',
-        style: const TextStyle(color: _mutedText, fontSize: 11),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Wrap(
-            spacing: 7,
-            runSpacing: 7,
-            children: filters.map((filter) {
-              final selected = _selectedFilter == filter;
-              final count = _filterCount(filter);
-
-              return ChoiceChip(
-                label: Text('$filter ($count)'),
-                selected: selected,
-                onSelected: (_) {
-                  setState(() => _selectedFilter = filter);
-                },
-                selectedColor: const Color(0xFFE6EDF7),
-                backgroundColor: const Color(0xFFF7F8FB),
-                labelStyle: TextStyle(
-                  color: selected ? _navy : _mutedText,
-                  fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
-                  fontSize: 10,
-                ),
-                side: BorderSide(
-                  color: selected ? const Color(0xFFB9CBE2) : _borderColor,
-                ),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                showCheckmark: false,
-              );
-            }).toList(),
-          ),
-          const SizedBox(height: 16),
-          const Divider(height: 1, color: _borderColor),
-          const SizedBox(height: 6),
-          if (_filteredResponses.isEmpty)
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 32),
-              child: Center(
-                child: Column(
-                  children: [
-                    Icon(
-                      _selectedFilter == 'HELP REQUESTED'
-                          ? Icons.health_and_safety_outlined
-                          : Icons.people_outline_rounded,
-                      size: 36,
-                      color: _mutedText.withValues(alpha: 0.6),
-                    ),
-                    const SizedBox(height: 10),
-                    Text(
-                      _selectedFilter == 'NO RESPONSE' ||
-                              _selectedFilter == 'EXPECTED'
-                          ? 'A complete people roster is needed for this list.'
-                          : 'No records for this status yet.',
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(color: _mutedText, fontSize: 12),
-                    ),
-                    if (_selectedFilter == 'NO RESPONSE' ||
-                        _selectedFilter == 'EXPECTED')
-                      const Padding(
-                        padding: EdgeInsets.only(top: 5),
-                        child: Text(
-                          'The current API returns submitted responses only.',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(color: _mutedText, fontSize: 10),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-            )
-          else
-            ..._filteredResponses.take(30).map((raw) {
-              final item = Map<String, dynamic>.from(raw as Map);
-              return _responseRow(item);
-            }),
-        ],
-      ),
-    );
-  }
-
-  Widget _responseRow(Map<String, dynamic> item) {
-    final status = '${item['response_status'] ?? ''}';
-    final color = _statusColor(status);
-    final name =
-        item['employee_name'] ??
-        item['full_name'] ??
-        item['visitor_name'] ??
-        item['name'] ??
-        'Person';
-    final message = item['message']?.toString() ?? '';
-    final location = item['location']?.toString() ?? '';
-
-    return Container(
-      padding: const EdgeInsets.symmetric(vertical: 12),
-      decoration: const BoxDecoration(
-        border: Border(bottom: BorderSide(color: _borderColor)),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            width: 38,
-            height: 38,
-            decoration: BoxDecoration(
-              color: color.withValues(alpha: 0.10),
-              borderRadius: BorderRadius.circular(11),
-            ),
-            child: Icon(_statusIcon(status), color: color, size: 20),
-          ),
-          const SizedBox(width: 11),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '$name',
-                  style: const TextStyle(
-                    color: _navy,
-                    fontWeight: FontWeight.w700,
-                    fontSize: 12,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  [
-                        if (location.isNotEmpty) location,
-                        if (message.isNotEmpty) message,
-                      ].join(' · ').isEmpty
-                      ? 'No additional details supplied'
-                      : [
-                          if (location.isNotEmpty) location,
-                          if (message.isNotEmpty) message,
-                        ].join(' · '),
-                  style: const TextStyle(color: _mutedText, fontSize: 11),
-                ),
-                const SizedBox(height: 5),
-                Text(
-                  _responseTimestamp(item),
-                  style: const TextStyle(color: _mutedText, fontSize: 10),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 8),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-            decoration: BoxDecoration(
-              color: color.withValues(alpha: 0.09),
-              borderRadius: BorderRadius.circular(7),
-            ),
-            child: Text(
-              _statusLabel(status),
-              style: TextStyle(
-                color: color,
-                fontSize: 9,
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildIncidentDetailsCard() {
-    final active = _incident != null;
-
-    return _panel(
-      title: 'Incident details',
-      trailing: Icon(
-        active ? Icons.warning_amber_rounded : Icons.shield_outlined,
-        color: active ? _red : _green,
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _detailLine(
-            'Current status',
-            active ? 'Incident active' : 'No active incident',
-            valueColor: active ? _red : _green,
-          ),
-          _detailLine('Incident ID', active ? '#${_incident!['id']}' : '—'),
-          _detailLine(
-            'Incident title',
-            active ? '${_incident!['title'] ?? 'Untitled'}' : '—',
-          ),
-          _detailLine(
-            'Created by',
-            active ? '${_incident!['created_by'] ?? 'Not supplied'}' : '—',
-          ),
-          _detailLine('People responded', '${_count('responded')}'),
-          _detailLine(
-            'Help requests',
-            '${_count('help_requested')}',
-            valueColor: _red,
-          ),
-          if (active)
-            _detailLine('Incident created', _time(_incident!['created_at'])),
-          const SizedBox(height: 14),
-          const Divider(color: _borderColor),
-          const SizedBox(height: 8),
-          const Text(
-            'Verify personnel safety and coordinate assistance before issuing '
-            'an all-clear. This dashboard does not replace emergency procedures.',
-            style: TextStyle(color: _mutedText, fontSize: 11, height: 1.5),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _detailLine(String label, String value, {Color valueColor = _navy}) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(
-            child: Text(
-              label,
-              style: const TextStyle(color: _mutedText, fontSize: 11),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Flexible(
-            child: Text(
-              value,
-              textAlign: TextAlign.right,
-              style: TextStyle(
-                color: valueColor,
-                fontSize: 11,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildRequiresActionPage() {
-    return ListView(
-      padding: const EdgeInsets.all(24),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text(
-          'Requires Action',
-          style: TextStyle(
-            color: _navy,
-            fontSize: 25,
-            fontWeight: FontWeight.w800,
-          ),
+        Text(
+          'Visitor Directory (${_visitors.length})',
+          style: const TextStyle(fontSize: 21, fontWeight: FontWeight.bold),
         ),
         const SizedBox(height: 6),
         const Text(
-          'Review reported statuses and identify people who may need assistance.',
-          style: TextStyle(color: _mutedText, fontSize: 13),
+          'Visitors receive nine-hour access after successful email OTP '
+          'verification. Expired visitors must sign in again to renew access.',
         ),
-        const SizedBox(height: 20),
-        _buildRequiresActionCard(),
+        const SizedBox(height: 14),
+        _searchField('Search visitor name, VRF ID or email'),
+        const SizedBox(height: 14),
+        Expanded(
+          child: _panel(
+            child: list.isEmpty
+                ? const Center(child: Text('No visitors found.'))
+                : SingleChildScrollView(
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: DataTable(
+                        columns: const [
+                          DataColumn(label: Text('VRF ID')),
+                          DataColumn(label: Text('Visitor')),
+                          DataColumn(label: Text('Email')),
+                          DataColumn(label: Text('Verified')),
+                          DataColumn(label: Text('Status')),
+                          DataColumn(label: Text('Last login')),
+                          DataColumn(label: Text('Expires')),
+                          DataColumn(label: Text('Action')),
+                        ],
+                        rows: list.map((visitor) {
+                          final active = _active(visitor['is_active']);
+                          return DataRow(
+                            cells: [
+                              DataCell(Text(_string(visitor['vrf_id']))),
+                              DataCell(Text(_string(visitor['full_name']))),
+                              DataCell(Text(_string(visitor['email']))),
+                              DataCell(
+                                Text(
+                                  _active(visitor['email_verified'])
+                                      ? 'Yes'
+                                      : 'No',
+                                ),
+                              ),
+                              DataCell(
+                                _statusChip(active ? 'ACTIVE' : 'INACTIVE'),
+                              ),
+                              DataCell(Text(_date(visitor['last_login_at']))),
+                              DataCell(Text(_date(visitor['expires_at']))),
+                              DataCell(
+                                TextButton(
+                                  onPressed: () => _setVisitorActive(visitor),
+                                  child: Text(
+                                    active ? 'Deactivate' : 'Activate',
+                                  ),
+                                ),
+                              ),
+                            ],
+                          );
+                        }).toList(),
+                      ),
+                    ),
+                  ),
+          ),
+        ),
       ],
     );
   }
 
   Widget _buildIncidentsPage() {
-    final active = _incident != null;
-
-    return ListView(
-      padding: const EdgeInsets.all(24),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text(
-          'Incident Management',
-          style: TextStyle(
-            color: _navy,
-            fontSize: 25,
-            fontWeight: FontWeight.w800,
-          ),
-        ),
-        const SizedBox(height: 6),
-        const Text(
-          'Control the current incident and review its response information.',
-          style: TextStyle(color: _mutedText, fontSize: 13),
-        ),
-        const SizedBox(height: 20),
-        _buildIncidentBanner(active),
-        const SizedBox(height: 18),
-        _buildIncidentDetailsCard(),
-        const SizedBox(height: 18),
-        _buildRequiresActionCard(),
-      ],
-    );
-  }
-
-  Widget _buildManagementPlaceholder({
-    required String title,
-    required String subtitle,
-    required IconData icon,
-    required List<String> details,
-    String? actionLabel,
-    VoidCallback? onAction,
-  }) {
-    return ListView(
-      padding: const EdgeInsets.all(24),
-      children: [
-        Text(
-          title,
-          style: const TextStyle(
-            color: _navy,
-            fontSize: 25,
-            fontWeight: FontWeight.w800,
-          ),
-        ),
-        const SizedBox(height: 6),
-        Text(subtitle, style: const TextStyle(color: _mutedText, fontSize: 13)),
-        const SizedBox(height: 22),
-        Container(
-          padding: const EdgeInsets.all(24),
-          decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: _borderColor),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Container(
-                width: 52,
-                height: 52,
-                decoration: BoxDecoration(
-                  color: const Color(0xFFEAF0F8),
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                child: Icon(icon, color: _navy, size: 28),
+        Row(
+          children: [
+            const Expanded(
+              child: Text(
+                'Incident History',
+                style: TextStyle(fontSize: 21, fontWeight: FontWeight.bold),
               ),
-              const SizedBox(height: 18),
-              Text(
-                title,
-                style: const TextStyle(
-                  color: _navy,
-                  fontSize: 18,
-                  fontWeight: FontWeight.w800,
-                ),
+            ),
+            OutlinedButton.icon(
+              onPressed: _createIncidentDialog,
+              icon: const Icon(Icons.add_alert),
+              label: const Text('Start incident'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 14),
+        Wrap(
+          spacing: 12,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            OutlinedButton.icon(
+              onPressed: () => _pickDate(from: true),
+              icon: const Icon(Icons.calendar_today),
+              label: Text(
+                _fromDate == null
+                    ? 'From date'
+                    : 'From: ${_dateOnly(_fromDate!)}',
               ),
-              const SizedBox(height: 8),
-              const Text(
-                'This section is being prepared. The existing working API '
-                'features remain available while additional management '
-                'endpoints are implemented.',
-                style: TextStyle(color: _mutedText, fontSize: 12, height: 1.6),
+            ),
+            OutlinedButton.icon(
+              onPressed: () => _pickDate(from: false),
+              icon: const Icon(Icons.calendar_today),
+              label: Text(
+                _toDate == null ? 'To date' : 'To: ${_dateOnly(_toDate!)}',
               ),
-              const SizedBox(height: 18),
-              ...details.map(
-                (detail) => Padding(
-                  padding: const EdgeInsets.only(bottom: 12),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Icon(
-                        Icons.check_circle_outline,
-                        color: _green,
-                        size: 18,
+            ),
+            FilledButton(
+              onPressed: _applyIncidentFilters,
+              child: const Text('Apply filters'),
+            ),
+            TextButton(
+              onPressed: () async {
+                setState(() {
+                  _fromDate = null;
+                  _toDate = null;
+                });
+                await _applyIncidentFilters();
+              },
+              child: const Text('Clear filters'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Text('Records: ${_incidents.length}'),
+        const SizedBox(height: 12),
+        Expanded(
+          child: _panel(
+            child: _incidents.isEmpty
+                ? const Center(
+                    child: Text('No incidents found for this range.'),
+                  )
+                : SingleChildScrollView(
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: DataTable(
+                        columns: const [
+                          DataColumn(label: Text('ID')),
+                          DataColumn(label: Text('Title')),
+                          DataColumn(label: Text('Location')),
+                          DataColumn(label: Text('Status')),
+                          DataColumn(label: Text('Triggered by')),
+                          DataColumn(label: Text('Created')),
+                          DataColumn(label: Text('Cleared')),
+                        ],
+                        rows: _incidents.map((incident) {
+                          final active =
+                              _string(incident['status']) == 'ACTIVE';
+                          return DataRow(
+                            cells: [
+                              DataCell(Text('#${incident['id']}')),
+                              DataCell(Text(_string(incident['title']))),
+                              DataCell(Text(_string(incident['location']))),
+                              DataCell(
+                                _statusChip(active ? 'ACTIVE' : 'CLEARED'),
+                              ),
+                              DataCell(Text(_string(incident['created_by']))),
+                              DataCell(Text(_date(incident['created_at']))),
+                              DataCell(Text(_date(incident['cleared_at']))),
+                            ],
+                          );
+                        }).toList(),
                       ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Text(
-                          detail,
-                          style: const TextStyle(color: _navy, fontSize: 12),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              if (actionLabel != null && onAction != null) ...[
-                const SizedBox(height: 8),
-                FilledButton.icon(
-                  onPressed: onAction,
-                  icon: const Icon(Icons.add, size: 18),
-                  label: Text(actionLabel),
-                  style: FilledButton.styleFrom(
-                    backgroundColor: _navy,
-                    foregroundColor: Colors.white,
-                  ),
-                ),
-              ],
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _CreateEmployeeDialog extends StatefulWidget {
-  const _CreateEmployeeDialog();
-
-  @override
-  State<_CreateEmployeeDialog> createState() => _CreateEmployeeDialogState();
-}
-
-class _CreateEmployeeDialogState extends State<_CreateEmployeeDialog> {
-  final _formKey = GlobalKey<FormState>();
-  final _employeeCodeController = TextEditingController();
-  final _nameController = TextEditingController();
-  final _emailController = TextEditingController();
-
-  bool _saving = false;
-  String? _errorMessage;
-
-  @override
-  void dispose() {
-    _employeeCodeController.dispose();
-    _nameController.dispose();
-    _emailController.dispose();
-    super.dispose();
-  }
-
-  Future<void> _createEmployee() async {
-    if (_saving || !_formKey.currentState!.validate()) return;
-
-    setState(() {
-      _saving = true;
-      _errorMessage = null;
-    });
-
-    try {
-      final response = await http
-          .post(
-            Uri.parse('${WebApiService.baseUrl}/auth/officers/employees'),
-            headers: WebApiService.authHeaders,
-            body: jsonEncode({
-              'employee_code': _employeeCodeController.text.trim(),
-              'full_name': _nameController.text.trim(),
-              'email': _emailController.text.trim().toLowerCase(),
-            }),
-          )
-          .timeout(const Duration(seconds: 20));
-
-      Map<String, dynamic> data = {};
-
-      try {
-        final decoded = jsonDecode(response.body);
-        if (decoded is Map) {
-          data = Map<String, dynamic>.from(decoded);
-        }
-      } catch (_) {
-        // Keep a readable fallback message if the response is not JSON.
-      }
-
-      if (!mounted) return;
-
-      if (response.statusCode == 200 || response.statusCode == 201) {
-        Navigator.of(
-          context,
-        ).pop(data['message']?.toString() ?? 'Employee created successfully.');
-      } else {
-        setState(() {
-          _errorMessage =
-              data['detail']?.toString() ??
-              'Employee creation failed (${response.statusCode}).';
-        });
-      }
-    } catch (_) {
-      if (!mounted) return;
-
-      setState(() {
-        _errorMessage =
-            'Cannot connect to the server. Check the backend and try again.';
-      });
-    } finally {
-      if (mounted) {
-        setState(() => _saving = false);
-      }
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text(
-        'Add Employee',
-        style: TextStyle(fontWeight: FontWeight.w800),
-      ),
-      content: SizedBox(
-        width: 420,
-        child: SingleChildScrollView(
-          child: Form(
-            key: _formKey,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    'Enter the employee details to create their account.',
-                    style: TextStyle(color: _mutedText, fontSize: 12),
-                  ),
-                ),
-                const SizedBox(height: 20),
-                TextFormField(
-                  controller: _employeeCodeController,
-                  enabled: !_saving,
-                  decoration: const InputDecoration(
-                    labelText: 'Employee ID',
-                    hintText: 'e.g. EMP001',
-                    prefixIcon: Icon(Icons.badge_outlined),
-                    border: OutlineInputBorder(),
-                  ),
-                  validator: (value) {
-                    if (value == null || value.trim().isEmpty) {
-                      return 'Enter employee ID';
-                    }
-                    return null;
-                  },
-                ),
-                const SizedBox(height: 14),
-                TextFormField(
-                  controller: _nameController,
-                  enabled: !_saving,
-                  textCapitalization: TextCapitalization.words,
-                  decoration: const InputDecoration(
-                    labelText: 'Full name',
-                    prefixIcon: Icon(Icons.person_outline),
-                    border: OutlineInputBorder(),
-                  ),
-                  validator: (value) {
-                    if (value == null || value.trim().length < 2) {
-                      return 'Enter the employee name';
-                    }
-                    return null;
-                  },
-                ),
-                const SizedBox(height: 14),
-                TextFormField(
-                  controller: _emailController,
-                  enabled: !_saving,
-                  keyboardType: TextInputType.emailAddress,
-                  decoration: const InputDecoration(
-                    labelText: 'Company email',
-                    prefixIcon: Icon(Icons.email_outlined),
-                    border: OutlineInputBorder(),
-                  ),
-                  validator: (value) {
-                    final email = value?.trim() ?? '';
-                    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
-                        .hasMatch(email)) {
-                      return 'Enter a valid email address';
-                    }
-                    return null;
-                  },
-                ),
-                if (_errorMessage != null) ...[
-                  const SizedBox(height: 14),
-                  Align(
-                    alignment: Alignment.centerLeft,
-                    child: Text(
-                      _errorMessage!,
-                      style: const TextStyle(color: _red, fontSize: 12),
                     ),
                   ),
-                ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildActionPage() {
+    final actionPeople = _people.where((person) {
+      final status = _string(person['response_status']);
+      return status == 'NO_RESPONSE' ||
+          status == 'NEED_HELP' ||
+          status == 'SAFE_INSIDE';
+    }).toList();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Requires Action',
+          style: TextStyle(fontSize: 21, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 6),
+        const Text(
+          'No response, help requests and people still inside remain blockers '
+          'until a safe evacuation status is confirmed.',
+        ),
+        const SizedBox(height: 16),
+        if (_incident == null)
+          const Expanded(
+            child: Center(child: Text('There is no active incident.')),
+          )
+        else
+          _panel(
+            child: actionPeople.isEmpty
+                ? const SizedBox(
+                    height: 100,
+                    child: Center(
+                      child: Text('No people currently require action.'),
+                    ),
+                  )
+                : _peopleTable(actionPeople, applyFilter: false),
+          ),
+      ],
+    );
+  }
+
+  void _showHelpDetails(Map<String, dynamic> person) {
+    final message = _string(
+      person['message'],
+      'No additional details provided.',
+    );
+    final location = _string(person['location_details']);
+    final name = _string(person['name']);
+    final identifier = _string(person['identifier']);
+    final accountType = _string(person['account_type']);
+
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.health_and_safety, color: Colors.red),
+            SizedBox(width: 10),
+            Expanded(child: Text('Emergency help request')),
+          ],
+        ),
+        content: SizedBox(
+          width: 480,
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text(
+                  'Person',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: Colors.black54,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text('$name ($identifier)'),
+                const SizedBox(height: 16),
+                const Text(
+                  'Account type',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: Colors.black54,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(accountType.toUpperCase()),
+                const SizedBox(height: 16),
+                const Text(
+                  'Reported location',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: Colors.black54,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(location),
+                const SizedBox(height: 16),
+                const Text(
+                  'Help required / description',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: Colors.red,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFFF0F0),
+                    border: Border.all(color: const Color(0xFFFFC5C5)),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: SelectableText(
+                    message,
+                    style: const TextStyle(fontSize: 15),
+                  ),
+                ),
               ],
             ),
           ),
         ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: _saving ? null : () => Navigator.of(context).pop(),
-          child: const Text('CANCEL'),
-        ),
-        FilledButton(
-          onPressed: _saving ? null : _createEmployee,
-          style: FilledButton.styleFrom(
-            backgroundColor: _navy,
-            foregroundColor: Colors.white,
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Close'),
           ),
-          child: _saving
-              ? const SizedBox(
-                  width: 18,
-                  height: 18,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    color: Colors.white,
-                  ),
-                )
-              : const Text('CREATE EMPLOYEE'),
+        ],
+      ),
+    );
+  }
+
+  String _personStatus(Map<String, dynamic> person) {
+    return _string(person['response_status'], 'NO_RESPONSE').toUpperCase();
+  }
+
+  List<Map<String, dynamic>> _filterPeople(List<Map<String, dynamic>> people) {
+    final query = _peopleSearchController.text.trim().toLowerCase();
+
+    return people.where((person) {
+      final status = _personStatus(person);
+
+      final matchesFilter = switch (_peopleFilter) {
+        'NO_RESPONSE' => status == 'NO_RESPONSE',
+        'NEED_HELP' => status == 'NEED_HELP',
+        'SAFE_INSIDE' => status == 'SAFE_INSIDE',
+        'SAFE_OUTSIDE' => status == 'SAFE_OUTSIDE',
+        'SAFE_AT_ASSEMBLY' => status == 'SAFE_AT_ASSEMBLY',
+        'COMPLETED' => status != 'NO_RESPONSE',
+        _ => true,
+      };
+
+      final searchableText = [
+        person['name'],
+        person['identifier'],
+        person['account_type'],
+        person['response_status'],
+        person['location_details'],
+      ].join(' ').toLowerCase();
+
+      return matchesFilter && searchableText.contains(query);
+    }).toList();
+  }
+
+  Widget _peopleFilterBar() {
+    final options = <String, String>{
+      'ALL': 'All expected people',
+      'NO_RESPONSE': 'Not responded',
+      'NEED_HELP': 'Need help',
+      'SAFE_INSIDE': 'Safe inside',
+      'SAFE_OUTSIDE': 'Safe outside',
+      'SAFE_AT_ASSEMBLY': 'At assembly',
+      'COMPLETED': 'Completed responses',
+    };
+
+    return Wrap(
+      spacing: 12,
+      runSpacing: 12,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        SizedBox(
+          width: 240,
+          child: DropdownButtonFormField<String>(
+            value: _peopleFilter,
+            isExpanded: true,
+            decoration: const InputDecoration(
+              labelText: 'Filter people',
+              prefixIcon: Icon(Icons.filter_list),
+              border: OutlineInputBorder(),
+              contentPadding: EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 12,
+              ),
+            ),
+            items: options.entries.map((entry) {
+              return DropdownMenuItem<String>(
+                value: entry.key,
+                child: Text(entry.value, overflow: TextOverflow.ellipsis),
+              );
+            }).toList(),
+            onChanged: (value) {
+              if (value == null) return;
+              setState(() => _peopleFilter = value);
+            },
+          ),
+        ),
+        SizedBox(
+          width: 300,
+          child: TextField(
+            controller: _peopleSearchController,
+            onChanged: (_) => setState(() {}),
+            decoration: InputDecoration(
+              labelText: 'Search people',
+              hintText: 'Name or employee / visitor ID',
+              prefixIcon: const Icon(Icons.search),
+              suffixIcon: IconButton(
+                tooltip: 'Clear search',
+                onPressed: () {
+                  _peopleSearchController.clear();
+                  setState(() {});
+                },
+                icon: const Icon(Icons.close),
+              ),
+              border: const OutlineInputBorder(),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 12,
+              ),
+            ),
+          ),
+        ),
+        OutlinedButton.icon(
+          onPressed: () {
+            _peopleSearchController.clear();
+            setState(() => _peopleFilter = 'ALL');
+          },
+          icon: const Icon(Icons.restart_alt),
+          label: const Text('Reset'),
         ),
       ],
+    );
+  }
+
+  Widget _peopleTable(
+    List<Map<String, dynamic>> people, {
+    bool applyFilter = true,
+  }) {
+    final visiblePeople = applyFilter ? _filterPeople(people) : people;
+
+    if (visiblePeople.isEmpty) {
+      return const SizedBox(
+        height: 150,
+        child: Center(child: Text('No people match the selected filter.')),
+      );
+    }
+
+    final showHelpColumns = _peopleFilter == 'NEED_HELP';
+
+    final showResponseDetails =
+        _peopleFilter == 'ALL' || _peopleFilter == 'COMPLETED';
+
+    final showEvacuationColumn =
+        _peopleFilter == 'SAFE_OUTSIDE' || _peopleFilter == 'SAFE_AT_ASSEMBLY';
+
+    final columns = <DataColumn>[
+      const DataColumn(label: Text('Type')),
+      const DataColumn(label: Text('Name / Identifier')),
+      const DataColumn(label: Text('Response status')),
+      const DataColumn(label: Text('Reported location')),
+      if (showHelpColumns) ...[
+        const DataColumn(label: Text('Help details')),
+        const DataColumn(label: Text('Condition')),
+        const DataColumn(label: Text('Evacuation')),
+      ] else if (showResponseDetails)
+        const DataColumn(label: Text('Response details')),
+      if (showEvacuationColumn) const DataColumn(label: Text('Evacuation')),
+      const DataColumn(label: Text('Response time')),
+      const DataColumn(label: Text('Warden status')),
+      const DataColumn(label: Text('Actions')),
+    ];
+
+    final rows = visiblePeople.map((person) {
+      final type = _string(person['account_type'], 'employee');
+      final status = _personStatus(person);
+      final needsAction =
+          status == 'NO_RESPONSE' ||
+          status == 'NEED_HELP' ||
+          status == 'SAFE_INSIDE';
+
+      final message = _string(
+        person['message'],
+        'No additional details provided.',
+      );
+
+      final cells = <DataCell>[
+        DataCell(_statusChip(type.toUpperCase())),
+        DataCell(
+          SizedBox(
+            width: 180,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  _string(person['name']),
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+                Text(
+                  _string(person['identifier']),
+                  style: const TextStyle(fontSize: 12, color: Colors.black54),
+                ),
+              ],
+            ),
+          ),
+        ),
+        DataCell(_statusChip(status)),
+        DataCell(
+          SizedBox(
+            width: 160,
+            child: Text(
+              _string(person['location_details']),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 2,
+            ),
+          ),
+        ),
+      ];
+
+      if (showHelpColumns) {
+        cells.addAll([
+          DataCell(
+            SizedBox(
+              width: 220,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(message, maxLines: 2, overflow: TextOverflow.ellipsis),
+                  TextButton(
+                    onPressed: () => _showHelpDetails(person),
+                    child: const Text('View full details'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          DataCell(
+            SizedBox(
+              width: 140,
+              child: Text(_string(person['condition_status'])),
+            ),
+          ),
+          DataCell(
+            SizedBox(
+              width: 150,
+              child: Text(_string(person['evacuation_status'])),
+            ),
+          ),
+        ]);
+      } else if (showResponseDetails) {
+        cells.add(
+          DataCell(
+            SizedBox(
+              width: 220,
+              child: status == 'NEED_HELP'
+                  ? TextButton.icon(
+                      onPressed: () => _showHelpDetails(person),
+                      icon: const Icon(Icons.open_in_new, size: 16),
+                      label: const Text('View help details'),
+                    )
+                  : Text(
+                      status == 'NO_RESPONSE'
+                          ? 'No response submitted'
+                          : _string(person['message'], 'No additional details'),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+            ),
+          ),
+        );
+      }
+
+      if (showEvacuationColumn) {
+        cells.add(DataCell(Text(_string(person['evacuation_status']))));
+      }
+
+      cells.addAll([
+        DataCell(Text(_date(person['responded_at']))),
+        DataCell(
+          SizedBox(
+            width: 140,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  _active(person['warden_dispatched'])
+                      ? 'Dispatched'
+                      : 'Not dispatched',
+                ),
+                if (_active(person['located']))
+                  const Text(
+                    'Located',
+                    style: TextStyle(color: Colors.green, fontSize: 12),
+                  ),
+              ],
+            ),
+          ),
+        ),
+        DataCell(
+          SizedBox(
+            width: 180,
+            child: Wrap(
+              spacing: 4,
+              children: [
+                if (needsAction)
+                  TextButton(
+                    onPressed: () => _dispatchPerson(person),
+                    child: const Text('Dispatch'),
+                  ),
+                if (status == 'NEED_HELP' && !_active(person['located']))
+                  TextButton(
+                    onPressed: () => _markLocated(person),
+                    child: const Text('Mark located'),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ]);
+
+      return DataRow(cells: cells);
+    }).toList();
+
+    final tableHeight = (56 + visiblePeople.length * 88)
+        .clamp(144, 440)
+        .toDouble();
+
+    return SizedBox(
+      height: tableHeight,
+      child: Container(
+        width: double.infinity,
+        decoration: BoxDecoration(
+          border: Border.all(color: const Color(0xFFE1E6EF)),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Scrollbar(
+          controller: _peopleVerticalController,
+          thumbVisibility: true,
+          child: SingleChildScrollView(
+            controller: _peopleVerticalController,
+            scrollDirection: Axis.vertical,
+            child: Scrollbar(
+              controller: _peopleHorizontalController,
+              thumbVisibility: true,
+              notificationPredicate: (notification) =>
+                  notification.metrics.axis == Axis.horizontal,
+              child: SingleChildScrollView(
+                controller: _peopleHorizontalController,
+                scrollDirection: Axis.horizontal,
+                child: DataTable(
+                  headingRowColor: WidgetStateProperty.all(
+                    const Color(0xFFF0F4FA),
+                  ),
+                  headingTextStyle: const TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF24364B),
+                  ),
+                  dataRowMinHeight: 64,
+                  dataRowMaxHeight: 92,
+                  columnSpacing: 24,
+                  horizontalMargin: 18,
+                  columns: columns,
+                  rows: rows,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _searchField(String hint) {
+    return SizedBox(
+      width: 460,
+      child: TextField(
+        controller: _searchController,
+        onChanged: (_) => setState(() {}),
+        decoration: InputDecoration(
+          hintText: hint,
+          prefixIcon: const Icon(Icons.search),
+          filled: true,
+          fillColor: Colors.white,
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+          contentPadding: const EdgeInsets.symmetric(vertical: 12),
+        ),
+      ),
+    );
+  }
+
+  Widget _statusChip(String status) {
+    Color color;
+
+    switch (status.toUpperCase()) {
+      case 'ACTIVE':
+      case 'SAFE_AT_ASSEMBLY':
+      case 'SAFE_OUTSIDE':
+      case 'EMPLOYEE':
+      case 'LOCATED':
+        color = Colors.green.shade700;
+        break;
+      case 'CLEARED':
+      case 'VISITOR':
+        color = Colors.blue.shade700;
+        break;
+      case 'SAFE_INSIDE':
+      case 'NO_RESPONSE':
+      case 'INACTIVE':
+        color = Colors.orange.shade800;
+        break;
+      case 'NEED_HELP':
+        color = Colors.red.shade700;
+        break;
+      default:
+        color = Colors.blueGrey.shade700;
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Text(
+        status.replaceAll('_', ' '),
+        style: TextStyle(
+          color: color,
+          fontSize: 11,
+          fontWeight: FontWeight.bold,
+        ),
+      ),
+    );
+  }
+
+  Widget _panel({required Widget child}) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: const Color(0xFFE5E9F0)),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: child,
     );
   }
 }

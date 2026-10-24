@@ -54,3 +54,16 @@ Thumbs.db
 # Local diagnostic scripts; review separately if needed
 **/test_email.py
 **/test_db.py
+
+# Local configuration
+**/android/local.properties
+**/ios/Flutter/Generated.xcconfig
+
+# Local credentials and certificates
+**/*credentials*
+**/*service-account*.json
+**/*.jks
+**/*.keystore
+
+# Editor and operating-system files
+.vs/

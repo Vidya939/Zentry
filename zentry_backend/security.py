@@ -9,7 +9,7 @@ password_hash = PasswordHash.recommended()
 
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
 JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_MINUTES = 60
+ACCESS_TOKEN_MINUTES = 480
 
 
 def hash_password(password: str) -> str:

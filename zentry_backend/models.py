@@ -26,9 +26,10 @@ class Employee(Base):
     email: Mapped[str] = mapped_column(
         String(255), unique=True, nullable=False
     )
-    is_active: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    is_active: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1", nullable=False
+    )
 
-    # Existing employees can receive credentials without deleting their records.
     password_hash: Mapped[str | None] = mapped_column(
         String(255), nullable=True
     )
@@ -59,6 +60,12 @@ class OfficerAccount(Base):
     email_verified_at: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True
     )
+
+    # Optional profile location. Existing accounts may have no location.
+    location: Mapped[str | None] = mapped_column(
+        String(200), nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
     )
@@ -82,6 +89,12 @@ class Visitor(Base):
     expires_at: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True
     )
+
+    # Updated by the visitor authentication endpoint after successful login.
+    last_login_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
     )
@@ -117,12 +130,14 @@ class Incident(Base):
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     location: Mapped[str] = mapped_column(String(200), nullable=False)
-    status: Mapped[str] = mapped_column(String(30), default="ACTIVE")
+    status: Mapped[str] = mapped_column(
+        String(30), default="ACTIVE", server_default="ACTIVE",
+        nullable=False
+    )
     created_by: Mapped[str] = mapped_column(String(120), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
     )
-
     cleared_at: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True
     )
@@ -142,7 +157,6 @@ class IncidentResponse(Base):
     )
 
     # A response belongs to either an employee or a visitor.
-    # The migration must make the existing employee_id column nullable.
     employee_id: Mapped[int | None] = mapped_column(
         ForeignKey("employees.id"), nullable=True
     )
@@ -151,12 +165,32 @@ class IncidentResponse(Base):
     )
 
     response_status: Mapped[str] = mapped_column(
-        String(30), default="NO_RESPONSE", nullable=False
+        String(30), default="NO_RESPONSE", server_default="NO_RESPONSE",
+        nullable=False
     )
+
+    # Additional response details, such as help requested or injury notes.
     message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # The person's selected location during the incident.
     location_details: Mapped[str | None] = mapped_column(
         String(200), nullable=True
     )
+
+    # Optional structured condition and evacuation selections from the app.
+    condition_status: Mapped[str | None] = mapped_column(
+        String(30), nullable=True
+    )
+    evacuation_status: Mapped[str | None] = mapped_column(
+        String(30), nullable=True
+    )
+
+    # First response time for calculating response duration against
+    # Incident.created_at. updated_at remains the latest modification time.
+    responded_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+
     assigned_to_officer_id: Mapped[int | None] = mapped_column(
         ForeignKey("officer_accounts.id"), nullable=True
     )
@@ -166,6 +200,7 @@ class IncidentResponse(Base):
     located_at: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True
     )
+
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
         server_default=func.now(),
@@ -207,5 +242,4 @@ class IncidentAuditLog(Base):
     action: Mapped[str] = mapped_column(String(80), nullable=False)
     details: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, server_default=func.now(), nullable=False
-    )
+        DateTime, server_default=func.now(), nullable=False)

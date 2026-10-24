@@ -1,20 +1,89 @@
 import 'package:flutter/material.dart';
 
-class ZentryHelp extends StatelessWidget {
-  const ZentryHelp({super.key});
+import 'zentry_api_service.dart';
+
+class ZentryHelp extends StatefulWidget {
+  final int incidentId;
+
+  const ZentryHelp({super.key, required this.incidentId});
+
+  @override
+  State<ZentryHelp> createState() => _ZentryHelpState();
+}
+
+class _ZentryHelpState extends State<ZentryHelp> {
+final _otherHelpController = TextEditingController();
+
+String? _helpDetails;
+
+static const List<String> _helpOptions = [
+  'Need help evacuating',
+  'Unable to use stairs',
+  'Injured and need assistance',
+  'Need other assistance',
+];
+
+  static const List<String> _locations = [
+    'Admin Block',
+    'North Block',
+    'Conf Room',
+    'North Block Canteen',
+  ];
+
+  String? _location;
+  bool _submitting = false;
+  bool _submitted = false;
+
+  Future<void> _submitHelpRequest() async {
+    if (_submitting || _submitted) return;
+
+    // if (!_formKey.currentState!.validate()) return;
+
+    setState(() => _submitting = true);
+
+    try {
+      await ZentryApiService.submitResponse(
+        incidentId: widget.incidentId,
+        status: 'NEED_HELP',
+        locationDetails: _location!,
+message: _helpDetails == 'Need other assistance'
+    ? 'Need other assistance: ${_otherHelpController.text.trim()}'
+    : _helpDetails!,
+          );
+
+      if (!mounted) return;
+      setState(() => _submitted = true);
+    } catch (e) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(e.toString().replaceFirst('Exception: ', ''))),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _submitting = false);
+      }
+    }
+  }
+
+@override
+void dispose() {
+  _otherHelpController.dispose();
+  super.dispose();
+}
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        automaticallyImplyLeading: true,
+        automaticallyImplyLeading: false,
         elevation: 10,
         shadowColor: Colors.black,
-        title: Row(
+        title: const Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            const Text(
-              "Zentry Deres",
+            Text(
+              'Zentry Deres',
               style: TextStyle(
                 fontSize: 25,
                 fontWeight: FontWeight.bold,
@@ -33,145 +102,220 @@ class ZentryHelp extends StatelessWidget {
         ),
       ),
       body: SingleChildScrollView(
-        child: Padding(
-          padding: const EdgeInsets.all(8.0),
-          child: Column(
-            children: [
-              Card(
-                shape: const RoundedRectangleBorder(),
-                color: const Color.fromARGB(255, 227, 38, 25),
-                child: Padding(
-                  padding: const EdgeInsets.all(8.0),
-                  child: SizedBox(
+        padding: const EdgeInsets.all(20),
+        child: _submitted
+            ? Column(
+                children: [
+                  const SizedBox(height: 30),
+                  const Icon(Icons.check_circle, color: Colors.green, size: 90),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'Help request submitted',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    'The safety officer has been notified of your '
+                    'reported location and help request.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 16),
+                  ),
+                  const SizedBox(height: 20),
+                  _detailRow('Location', _location!),
+                  _detailRow(
+  'Help required',
+  _helpDetails == 'Need other assistance'
+      ? 'Need other assistance: ${_otherHelpController.text.trim()}'
+      : _helpDetails ?? '',
+),
+                  const SizedBox(height: 24),
+                  SizedBox(
                     width: double.infinity,
-                    child: Padding(
-                      padding: const EdgeInsets.all(8.0),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'HELP REQUESTED - 0:38',
-                            style: TextStyle(fontSize: 18, color: Colors.white),
-                          ),
-                          Text(
-                            'HELP IS COMING',
-                            style: TextStyle(
-                              fontSize: 37,
-                              color: Colors.white,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ],
-                      ),
+                    child: ElevatedButton(
+                      onPressed: () => Navigator.pop(context),
+                      child: const Text('Back to emergency'),
                     ),
                   ),
-                ),
-              ),
-        
-              const SizedBox(height: 20),
-        
-              // Green tick and confirmation
-              const Icon(Icons.error, color: Colors.red, size: 120),
-        
-              const SizedBox(height: 16),
-        
-              const Text(
-                'Officer Notified',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontSize: 24,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.red,
-                ),
-              ),
-        
-              const SizedBox(height: 8),
-        
-              const Text(
-                'Warden Dispacthed',
-                style: TextStyle(fontSize: 15, color: Colors.grey),
-              ),
-        
-              const SizedBox(height: 4),
-              const SizedBox(height: 30),
-        
-              const Divider(),
-        
-              // Status
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 16),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                ],
+              )
+            : Form(
+                // key: _formKey,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    Text(
-                      'Acknowledged',
-                      style: TextStyle(fontSize: 18, color: Colors.black),
+                    Card(
+                      shape: const RoundedRectangleBorder(),
+                      color: const Color.fromARGB(255, 227, 38, 25),
+                      child: const Padding(
+                        padding: EdgeInsets.all(16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'EMERGENCY HELP REQUEST',
+                              style: TextStyle(
+                                fontSize: 17,
+                                color: Colors.white,
+                              ),
+                            ),
+                            SizedBox(height: 8),
+                            Text(
+                              'I NEED HELP',
+                              style: TextStyle(
+                                fontSize: 32,
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
                     ),
-                    Text(
-                      '00:11',
+                    const SizedBox(height: 24),
+                    const Text(
+                      'Where are you?',
                       style: TextStyle(
-                        fontSize: 16,
+                        fontSize: 19,
                         fontWeight: FontWeight.bold,
-                        color: Colors.green,
                       ),
                     ),
-                  ],
-                ),
-              ),
-        
-              const Divider(),
-        
-              // Location
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 16),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text(
-                      'Location',
-                      style: TextStyle(fontSize: 18, color: Colors.black),
+                    const SizedBox(height: 10),
+                    DropdownButtonFormField<String>(
+                      initialValue: _location,
+                      isExpanded: true,
+                      decoration: const InputDecoration(
+                        labelText: 'Location',
+                        hintText: 'Select your current location',
+                        border: OutlineInputBorder(),
+                      ),
+                      items: _locations
+                          .map(
+                            (location) => DropdownMenuItem<String>(
+                              value: location,
+                              child: Text(location),
+                            ),
+                          )
+                          .toList(),
+                      onChanged: _submitting
+                          ? null
+                          : (value) => setState(() => _location = value),
+                      validator: (value) => value == null || value.isEmpty
+                          ? 'Please select your location'
+                          : null,
                     ),
-                    Flexible(
-                      child: Text(
-                        'Conf, Room2',
-                        textAlign: TextAlign.end,
-                        style: TextStyle(fontSize: 16, color: Colors.black),
+                    const SizedBox(height: 24),
+                    const Text(
+                      'What help do you need?',
+                      style: TextStyle(
+                        fontSize: 19,
+                        fontWeight: FontWeight.bold,
                       ),
                     ),
+                    const SizedBox(height: 10),
+DropdownButtonFormField<String>(
+  initialValue: _helpDetails,
+  isExpanded: true,
+  decoration: const InputDecoration(
+    labelText: 'Help required',
+    hintText: 'Select an option',
+    border: OutlineInputBorder(),
+  ),
+  items: _helpOptions.map((option) {
+    return DropdownMenuItem<String>(
+      value: option,
+      child: Text(
+        option,
+        overflow: TextOverflow.ellipsis,
+      ),
+    );
+  }).toList(),
+  onChanged: _submitting
+      ? null
+      : (value) {
+          setState(() {
+            _helpDetails = value;
+            if (value != 'Need other assistance') {
+              _otherHelpController.clear();
+            }
+          });
+        },
+  validator: (value) {
+    if (value == null) {
+      return 'Please select an option';
+    }
+    return null;
+  },
+),
+
+if (_helpDetails == 'Need other assistance') ...[
+  const SizedBox(height: 16),
+  TextFormField(
+    controller: _otherHelpController,
+    enabled: !_submitting,
+    maxLines: 3,
+    decoration: const InputDecoration(
+      labelText: 'Describe the help you need',
+      hintText: 'Enter your specific assistance requirement',
+      border: OutlineInputBorder(),
+      alignLabelWithHint: true,
+    ),
+    validator: (value) {
+      if (_helpDetails == 'Need other assistance' &&
+          (value == null || value.trim().isEmpty)) {
+        return 'Please describe the help you need';
+      }
+      return null;
+    },
+  ),
+],
+                    const SizedBox(height: 20),
+                    SizedBox(
+                      height: 50,
+                      child: ElevatedButton(
+                        onPressed: _submitting ? null : _submitHelpRequest,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.red,
+                          foregroundColor: Colors.white,
+                        ),
+                        child: _submitting
+                            ? const CircularProgressIndicator(
+                                color: Colors.white,
+                              )
+                            : const Text(
+                                'Send help request',
+                                style: TextStyle(fontSize: 17),
+                              ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    OutlinedButton(
+                      onPressed: _submitting
+                          ? null
+                          : () => Navigator.pop(context),
+                      child: const Text('Back'),
+                    ),
                   ],
                 ),
               ),
-        
-              const Divider(),
-        
-              // Response time
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 16),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text(
-                      'Source',
-                      style: TextStyle(fontSize: 18, color: Colors.black),
-                    ),
-                    Text(
-                      'Mobile',
-                      style: TextStyle(fontSize: 16, color: Colors.black),
-                    ),
-                  ],
-                ),
-              ),
-        
-              const Divider(),
-        
-              const SizedBox(height: 30),
-        
-        
-              Text('Stay where you are if it safe',style: TextStyle(fontSize: 18, color: Colors.grey),),
-              Text('Keep the phone with you',style: TextStyle(fontSize: 18, color: Colors.grey),),
-            ],
+      ),
+    );
+  }
+
+  Widget _detailRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Text(
+              label,
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
           ),
-        ),
+          Expanded(child: Text(value, textAlign: TextAlign.end)),
+        ],
       ),
     );
   }
